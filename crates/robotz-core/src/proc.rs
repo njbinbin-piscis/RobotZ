@@ -6,8 +6,8 @@
 //! through these helpers applies `CREATE_NO_WINDOW` uniformly. The helpers
 //! are no-ops on non-Windows platforms.
 //!
-//! Vendored from `pisci_kernel::proc` so RobotZ has no runtime dependency on
-//! the pisci engine.
+//! Vendored from `piscis_kernel::proc` so RobotZ has no runtime dependency on
+//! the piscis engine.
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;

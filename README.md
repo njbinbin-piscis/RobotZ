@@ -1,7 +1,7 @@
 # RobotZ
 
 A standalone **computer-use agent toolkit**, extracted from
-[openpisci](../openpisci)'s desktop-automation layer.
+[openpiscis](../openpiscis)'s desktop-automation layer.
 
 RobotZ packages the ability to *drive a computer* — take screenshots, move the
 mouse, type, manage windows, read the Windows UI Automation tree, and automate
@@ -30,8 +30,8 @@ client at the built `robotz-mcp` binary over stdio. It exposes `screen_capture`,
 `desktop_automation`, `browser`, and (on Windows) `uia`, with screenshots
 returned as MCP image content.
 
-The `robotz-*` crates expose an optional **`pisci-kernel`** feature that
-re-implements `pisci_kernel::Tool` on top of the same structs, so openpisci can
+The `robotz-*` crates expose an optional **`piscis-kernel`** feature that
+re-implements `piscis_kernel::Tool` on top of the same structs, so openpiscis can
 consume RobotZ as a drop-in replacement for its in-tree tools.
 
 ## Runtime dependencies
@@ -47,7 +47,7 @@ These are *external programs* the tools shell out to (not bundled):
 ## Status
 
 Functional. All four crates build and the MCP server responds to
-`initialize` / `tools/list`. The optional `pisci-kernel` feature (see each
-crate's `pisci_bridge`) lets openpisci consume these crates as a drop-in
+`initialize` / `tools/list`. The optional `piscis-kernel` feature (see each
+crate's `piscis_bridge`) lets openpiscis consume these crates as a drop-in
 replacement for its in-tree tools — that migration (removing the originals from
-openpisci) is the remaining step.
+openpiscis) is the remaining step.

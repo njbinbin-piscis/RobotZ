@@ -170,7 +170,7 @@ pub(crate) fn encode_and_return_with_cursor_offset(
         // Save a debug copy as PNG so we can inspect the grid visually
         #[cfg(debug_assertions)]
         {
-            let debug_path = std::env::temp_dir().join("pisci_grid_debug.png");
+            let debug_path = std::env::temp_dir().join("piscis_grid_debug.png");
             let _ = img.save(&debug_path);
             tracing::info!(
                 "screen_capture: grid image saved to {}",

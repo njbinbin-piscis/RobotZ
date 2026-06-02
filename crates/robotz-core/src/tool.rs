@@ -1,8 +1,8 @@
 //! The core [`Tool`] abstraction and its supporting value types.
 //!
-//! Deliberately shaped like `pisci_kernel::agent::tool` (same method names,
+//! Deliberately shaped like `piscis_kernel::agent::tool` (same method names,
 //! same `ToolResult`/`ImageData`) so that automation tools port over with a
-//! single import swap. Fields that only the full pisci agent loop needs
+//! single import swap. Fields that only the full piscis agent loop needs
 //! (email credentials, memory owner, pool session, …) are intentionally
 //! dropped — the computer-use tools never read them.
 
@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 /// Context handed to every tool invocation.
 ///
-/// Hosts (the MCP server, an embedded agent, or openpisci via the
-/// `pisci-kernel` feature) construct this per call. Computer-use tools only
+/// Hosts (the MCP server, an embedded agent, or openpiscis via the
+/// `piscis-kernel` feature) construct this per call. Computer-use tools only
 /// rely on the cooperative `cancel` flag and, occasionally, `workspace_root`
 /// for resolving relative `output_path`s.
 #[derive(Debug, Clone)]

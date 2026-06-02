@@ -63,7 +63,7 @@ pub struct MonitorCalibration {
     /// RMS of the residual (in physical pixels) after the fit; surfaced
     /// to the user so they can decide whether to retry.
     pub residual_rms_px: f64,
-    /// Number of (user_target, pisci_actual) pairs that fed the fit.
+    /// Number of (user_target, piscis_actual) pairs that fed the fit.
     pub sample_count: usize,
     /// ISO-8601 timestamp.
     pub calibrated_at: String,
@@ -301,7 +301,7 @@ pub fn fit_linear(targets: &[f64], actuals: &[f64]) -> (f64, f64, f64) {
 /// The fit itself is done in monitor-local space (matching
 /// `apply_to_point`), then the resulting linear transform is
 /// expressed as `corrected_local = scale * raw_local + offset`, so
-/// `Pisci(corrected)` will land on `User(target)`.
+/// `Piscis(corrected)` will land on `User(target)`.
 ///
 /// Why fit `target = scale * actual + offset` (not the other way
 /// around)? At calibration time the agent calls `uia.click(target)`
@@ -314,13 +314,13 @@ pub fn fit_monitor_calibration(
     monitor_index: usize,
     monitor_rect: [i32; 4],
     user_targets: &[(i32, i32)],
-    pisci_actuals: &[(i32, i32)],
+    piscis_actuals: &[(i32, i32)],
 ) -> MonitorCalibration {
     let [l, t, _r, _b] = monitor_rect;
     let local_targets_x: Vec<f64> = user_targets.iter().map(|(x, _)| (x - l) as f64).collect();
     let local_targets_y: Vec<f64> = user_targets.iter().map(|(_, y)| (y - t) as f64).collect();
-    let local_actuals_x: Vec<f64> = pisci_actuals.iter().map(|(x, _)| (x - l) as f64).collect();
-    let local_actuals_y: Vec<f64> = pisci_actuals.iter().map(|(_, y)| (y - t) as f64).collect();
+    let local_actuals_x: Vec<f64> = piscis_actuals.iter().map(|(x, _)| (x - l) as f64).collect();
+    let local_actuals_y: Vec<f64> = piscis_actuals.iter().map(|(_, y)| (y - t) as f64).collect();
 
     // We want: when the agent asks to click `target`, send `corrected`
     // such that `actual(corrected) == target`. Empirically
@@ -341,7 +341,7 @@ pub fn fit_monitor_calibration(
         scale_y: sy,
         offset_y: oy,
         residual_rms_px: rms,
-        sample_count: user_targets.len().min(pisci_actuals.len()),
+        sample_count: user_targets.len().min(piscis_actuals.len()),
         calibrated_at: chrono::Utc::now().to_rfc3339(),
     }
 }

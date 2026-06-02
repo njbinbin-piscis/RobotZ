@@ -1,9 +1,9 @@
-//! Adapter layer (enabled by the `pisci-kernel` feature) re-implementing
-//! `pisci_kernel::agent::tool::Tool` on top of [`crate::BrowserTool`], so
-//! openpisci can register the RobotZ browser tool through the kernel registry.
+//! Adapter layer (enabled by the `piscis-kernel` feature) re-implementing
+//! `piscis_kernel::agent::tool::Tool` on top of [`crate::BrowserTool`], so
+//! openpiscis can register the RobotZ browser tool through the kernel registry.
 
 use async_trait::async_trait;
-use pisci_kernel::agent::tool as pk;
+use piscis_kernel::agent::tool as pk;
 use serde_json::Value;
 
 use crate::BrowserTool;

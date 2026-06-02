@@ -1,4 +1,4 @@
-/* pisci-xi-helper: X11 mouse position helper for VMware+Xorg environments.
+/* piscis-xi-helper: X11 mouse position helper for VMware+Xorg environments.
  *
  * In VMware with Xorg, xdotool mousemove only moves the XTEST slave pointer
  * (device id=4), which is decoupled from the visible cursor and the XInput2
@@ -6,10 +6,10 @@
  * pointer, which correctly positions the X11 pointer for event delivery.
  *
  * Usage:
- *   pisci-xi-helper move <x> <y>
+ *   piscis-xi-helper move <x> <y>
  *     Move the master pointer to (x, y).
  *
- *   pisci-xi-helper drag <sx> <sy> <ex> <ey> [steps]
+ *   piscis-xi-helper drag <sx> <sy> <ex> <ey> [steps]
  *     Smooth drag from (sx,sy) to (ex,ey) with intermediate steps.
  *     Steps default to 20 if not specified.
  *     Uses XTestFakeMotionEvent to generate MotionNotify events between

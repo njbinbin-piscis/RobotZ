@@ -23,9 +23,9 @@ once_cell = "1"
 # the Win32 GDI path in src/screen/windows.rs instead.
 xcap = "0.9"
 
-# Optional: re-implement `pisci_kernel::Tool` on top of the robotz tools so
-# openpisci can consume this crate as a drop-in replacement. Off by default.
-pisci-kernel = { git = "https://github.com/njbinbin-piscis/piscis-engine.git", package = "pisci-kernel", optional = true }
+# Optional: re-implement `piscis_kernel::Tool` on top of the robotz tools so
+# openpiscis can consume this crate as a drop-in replacement. Off by default.
+piscis-kernel = { git = "https://github.com/njbinbin-piscis/piscis-engine.git", package = "piscis-kernel", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows UI Automation tree (uia tool).
@@ -41,7 +41,7 @@ windows = { version = "0.58", features = [
 [features]
 default = []
 # Bridge layer implemented in stage 2.
-pisci-kernel = ["dep:pisci-kernel"]
+piscis-kernel = ["dep:piscis-kernel"]
 
 [lints]
 workspace = true

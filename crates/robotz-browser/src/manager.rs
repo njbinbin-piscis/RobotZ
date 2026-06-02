@@ -169,7 +169,7 @@ impl BrowserManager {
         } else {
             // Unique temp profile per launch — avoids SingletonLock conflicts entirely
             let unique = format!(
-                "pisci-chrome-{}",
+                "piscis-chrome-{}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -222,7 +222,7 @@ impl BrowserManager {
 
         // In headed mode, the browser already has an open tab when launched.
         // Reuse it instead of creating a new one — otherwise the user sees the
-        // browser window but Pisci operates on a hidden second tab.
+        // browser window but Piscis operates on a hidden second tab.
         let page = if just_launched && !self.options.headless {
             // Give the browser a moment to register its initial tab
             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;

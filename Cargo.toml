@@ -2,7 +2,7 @@
 resolver = "2"
 members = ["crates/*"]
 
-# RobotZ — a standalone computer-use agent toolkit extracted from openpisci.
+# RobotZ — a standalone computer-use agent toolkit extracted from openpiscis.
 #
 # Layering:
 #   robotz-core        zero-dependency Tool/ToolResult/ImageData abstraction
@@ -12,16 +12,16 @@ members = ["crates/*"]
 #   robotz-browser     Chrome-DevTools-Protocol web automation.
 #   robotz-mcp         MCP server binary exposing the tools over stdio / HTTP.
 #
-# robotz-* crates carry an OPTIONAL `pisci-kernel` feature so the same tool
-# structs can be reused by openpisci by implementing `pisci_kernel::Tool`.
+# robotz-* crates carry an OPTIONAL `piscis-kernel` feature so the same tool
+# structs can be reused by openpiscis by implementing `piscis_kernel::Tool`.
 # With the feature OFF (the default) the crates depend on nothing from the
-# pisci ecosystem and can be open-sourced / embedded anywhere.
+# piscis ecosystem and can be open-sourced / embedded anywhere.
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["Pisci Team"]
+authors = ["Piscis Team"]
 rust-version = "1.77.2"
 
 [workspace.dependencies]
@@ -46,8 +46,8 @@ codegen-units = 1
 lto = true
 strip = true
 
-# For local verification of the optional `pisci-kernel` feature without
+# For local verification of the optional `piscis-kernel` feature without
 # hitting the network. Points the git dependency at the sibling checkout.
 [patch."https://github.com/njbinbin-piscis/piscis-engine.git"]
-pisci-kernel = { path = "../piscis-engine/pisci-kernel" }
-pisci-core = { path = "../piscis-engine/pisci-core" }
+piscis-kernel = { path = "../piscis-engine/piscis-kernel" }
+piscis-core = { path = "../piscis-engine/piscis-core" }

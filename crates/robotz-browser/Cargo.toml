@@ -27,11 +27,11 @@ reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], defau
 # ZIP extraction for Chrome for Testing downloads.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
-pisci-kernel = { git = "https://github.com/njbinbin-piscis/piscis-engine.git", package = "pisci-kernel", optional = true }
+piscis-kernel = { git = "https://github.com/njbinbin-piscis/piscis-engine.git", package = "piscis-kernel", optional = true }
 
 [features]
 default = []
-pisci-kernel = ["dep:pisci-kernel"]
+piscis-kernel = ["dep:piscis-kernel"]
 
 [lints]
 workspace = true

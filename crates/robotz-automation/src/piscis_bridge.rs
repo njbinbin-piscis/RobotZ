@@ -1,18 +1,18 @@
-//! Adapter layer (enabled by the `pisci-kernel` feature) that re-implements
-//! `pisci_kernel::agent::tool::Tool` on top of the RobotZ tools.
+//! Adapter layer (enabled by the `piscis-kernel` feature) that re-implements
+//! `piscis_kernel::agent::tool::Tool` on top of the RobotZ tools.
 //!
-//! This lets openpisci consume `robotz-automation` as a drop-in replacement
+//! This lets openpiscis consume `robotz-automation` as a drop-in replacement
 //! for its old in-tree `screen` / `desktop_automation` tools: the registry
-//! keeps handing the kernel `Box<dyn pisci_kernel::Tool>`, but the actual
+//! keeps handing the kernel `Box<dyn piscis_kernel::Tool>`, but the actual
 //! implementation now lives here.
 //!
 //! The bridge is intentionally thin: the computer-use tools don't read any of
-//! the rich `pisci_kernel::ToolContext` fields, so we only carry across the
+//! the rich `piscis_kernel::ToolContext` fields, so we only carry across the
 //! handful that map cleanly (`session_id`, `workspace_root`,
 //! `bypass_permissions`, `cancel`).
 
 use async_trait::async_trait;
-use pisci_kernel::agent::tool as pk;
+use piscis_kernel::agent::tool as pk;
 use serde_json::Value;
 
 use crate::{DesktopAutomationTool, ScreenTool};
