@@ -17,6 +17,9 @@ use serde_json::Value;
 
 use crate::{DesktopAutomationTool, ScreenTool};
 
+#[cfg(target_os = "windows")]
+use crate::UiaTool;
+
 fn to_robotz_ctx(ctx: &pk::ToolContext) -> robotz_core::ToolContext {
     robotz_core::ToolContext {
         session_id: ctx.session_id.clone(),
@@ -70,3 +73,5 @@ macro_rules! bridge_tool {
 
 bridge_tool!(ScreenTool);
 bridge_tool!(DesktopAutomationTool);
+#[cfg(target_os = "windows")]
+bridge_tool!(UiaTool);
