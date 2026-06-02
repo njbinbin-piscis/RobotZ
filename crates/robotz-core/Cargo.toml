@@ -1,0 +1,17 @@
+[package]
+name = "robotz-core"
+description = "Zero-dependency tool abstraction and process-spawn helpers for RobotZ"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

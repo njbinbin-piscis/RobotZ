@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# RobotZ — a standalone computer-use agent toolkit extracted from openpisci.
+#
+# Layering:
+#   robotz-core        zero-dependency Tool/ToolResult/ImageData abstraction
+#                      plus the cross-platform `proc` spawn helper.
+#   robotz-automation  desktop control: screen capture, mouse/keyboard,
+#                      window management, Windows UIA, mouse calibration.
+#   robotz-browser     Chrome-DevTools-Protocol web automation.
+#   robotz-mcp         MCP server binary exposing the tools over stdio / HTTP.
+#
+# robotz-* crates carry an OPTIONAL `pisci-kernel` feature so the same tool
+# structs can be reused by openpisci by implementing `pisci_kernel::Tool`.
+# With the feature OFF (the default) the crates depend on nothing from the
+# pisci ecosystem and can be open-sourced / embedded anywhere.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Pisci Team"]
+rust-version = "1.77.2"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+robotz-core = { path = "crates/robotz-core" }
+
+[workspace.lints.rust]
+warnings = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
+
+# For local verification of the optional `pisci-kernel` feature without
+# hitting the network. Points the git dependency at the sibling checkout.
+[patch."https://github.com/njbinbin-pisci/pisci-engine.git"]
+pisci-kernel = { path = "../pisci-engine/pisci-kernel" }
+pisci-core = { path = "../pisci-engine/pisci-core" }
