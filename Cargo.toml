@@ -48,6 +48,6 @@ strip = true
 
 # For local verification of the optional `pisci-kernel` feature without
 # hitting the network. Points the git dependency at the sibling checkout.
-[patch."https://github.com/njbinbin-pisci/pisci-engine.git"]
-pisci-kernel = { path = "../pisci-engine/pisci-kernel" }
-pisci-core = { path = "../pisci-engine/pisci-core" }
+[patch."https://github.com/njbinbin-piscis/piscis-engine.git"]
+pisci-kernel = { path = "../piscis-engine/pisci-kernel" }
+pisci-core = { path = "../piscis-engine/pisci-core" }

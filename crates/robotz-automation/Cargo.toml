@@ -25,7 +25,7 @@ xcap = "0.9"
 
 # Optional: re-implement `pisci_kernel::Tool` on top of the robotz tools so
 # openpisci can consume this crate as a drop-in replacement. Off by default.
-pisci-kernel = { git = "https://github.com/njbinbin-pisci/pisci-engine.git", package = "pisci-kernel", optional = true }
+pisci-kernel = { git = "https://github.com/njbinbin-piscis/piscis-engine.git", package = "pisci-kernel", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows UI Automation tree (uia tool).
