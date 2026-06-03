@@ -52,7 +52,9 @@ jobs:
             libxcb-xfixes0-dev \
             libxkbcommon-dev \
             libssl-dev \
-            libdbus-1-dev
+            libdbus-1-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
