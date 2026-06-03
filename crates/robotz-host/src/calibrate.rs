@@ -8,7 +8,7 @@ use robotz_automation::calibration;
 #[cfg(target_os = "windows")]
 use robotz_automation::calibration::{
     build_fingerprint, calibration_file_path, fit_monitor_calibration, save_file, set_cached,
-    CalibrationFile,
+    CalibrationFile, MonitorSnapshot,
 };
 use serde_json::json;
 

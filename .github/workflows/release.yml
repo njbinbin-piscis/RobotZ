@@ -105,7 +105,7 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: build
-    if: ${{ !cancelled() && contains(needs.build.result, 'success') }}
+    if: ${{ always() && !cancelled() && (contains(needs.build.result, 'success') || contains(needs.build.result, 'failure')) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
