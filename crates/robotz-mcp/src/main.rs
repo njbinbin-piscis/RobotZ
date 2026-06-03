@@ -19,6 +19,7 @@ use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
 use robotz_core::{Tool, ToolContext};
+use robotz_toolset::{build_tools, default_browser_manager};
 
 #[derive(Clone)]
 struct RobotzServer {
@@ -27,25 +28,9 @@ struct RobotzServer {
 
 impl RobotzServer {
     fn new(readonly: bool) -> Self {
-        let mut tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(robotz_automation::ScreenTool),
-            Arc::new(robotz_automation::DesktopAutomationTool),
-        ];
-
-        // Browser tool drives a managed (headless by default) Chrome instance.
-        let browser =
-            robotz_browser::create_browser_manager(robotz_browser::BrowserOptions::default());
-        tools.push(Arc::new(robotz_browser::BrowserTool::new(browser)));
-
-        #[cfg(target_os = "windows")]
-        tools.push(Arc::new(robotz_automation::UiaTool));
-
-        if readonly {
-            tools.retain(|t| t.is_read_only());
-        }
-
+        let browser = default_browser_manager();
         Self {
-            tools: Arc::new(tools),
+            tools: Arc::new(build_tools(readonly, browser)),
         }
     }
 

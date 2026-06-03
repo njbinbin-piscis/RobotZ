@@ -18,7 +18,7 @@ members = ["crates/*"]
 # piscis ecosystem and can be open-sourced / embedded anywhere.
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Piscis Team"]
@@ -46,8 +46,8 @@ codegen-units = 1
 lto = true
 strip = true
 
-# For local verification of the optional `piscis-kernel` feature without
-# hitting the network. Points the git dependency at the sibling checkout.
-[patch."https://github.com/njbinbin-piscis/piscis-engine.git"]
-piscis-kernel = { path = "../piscis-engine/piscis-kernel" }
-piscis-core = { path = "../piscis-engine/piscis-core" }
+# Pin matches openpiscis / CodeZ / agent-workbench (tag v0.7.38 on piscis-engine).
+# For local engine hacking, uncomment:
+# [patch."https://github.com/njbinbin-piscis/piscis-engine.git"]
+# piscis-kernel = { path = "../piscis-engine/piscis-kernel" }
+# piscis-core = { path = "../piscis-engine/piscis-core" }

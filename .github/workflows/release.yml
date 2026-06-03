@@ -1,0 +1,148 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            bin_host: robotz-host
+            bin_mcp: robotz-mcp
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            bin_host: robotz-host.exe
+            bin_mcp: robotz-mcp.exe
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            bin_host: robotz-host
+            bin_mcp: robotz-mcp
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libssl-dev \
+            libdbus-1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release -p robotz-host -p robotz-mcp
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG="robotz-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${PKG}/bin"
+          cp "target/release/${{ matrix.bin_host }}" "dist/${PKG}/bin/"
+          cp "target/release/${{ matrix.bin_mcp }}" "dist/${PKG}/bin/"
+          cp scripts/install.sh "dist/${PKG}/"
+          cp README.md "dist/${PKG}/"
+          chmod +x "dist/${PKG}/bin/"* "dist/${PKG}/install.sh"
+          cd dist && tar czf "${PKG}.tar.gz" "${PKG}"
+          echo "ARCHIVE_PATH=dist/${PKG}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "$env:GITHUB_REF_NAME".TrimStart('v')
+          $pkg = "robotz-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist\$pkg\bin" | Out-Null
+          Copy-Item "target\release\${{ matrix.bin_host }}" "dist\$pkg\bin\"
+          Copy-Item "target\release\${{ matrix.bin_mcp }}" "dist\$pkg\bin\"
+          Copy-Item "scripts\install.ps1" "dist\$pkg\"
+          Copy-Item "README.md" "dist\$pkg\"
+          Compress-Archive -Path "dist\$pkg" -DestinationPath "dist\$pkg.zip"
+          echo "ARCHIVE_PATH=dist/$pkg.zip" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: robotz-${{ matrix.target }}
+          path: ${{ env.ARCHIVE_PATH }}
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List packages
+        run: find dist -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: RobotZ ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/**/*.tar.gz
+            dist/**/*.zip
+          body: |
+            ## Install
+
+            **Linux / macOS**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/njbinbin-piscis/RobotZ/${{ github.ref_name }}/scripts/install.sh | bash -s -- ${{ github.ref_name }}
+            ```
+
+            Or download the archive for your platform below, extract, and run:
+            ```bash
+            ./install.sh
+            ./bin/robotz-host    # visual test panel
+            ./bin/robotz-mcp     # MCP server (stdio)
+            ```
+
+            **Windows** — download `robotz-*-pc-windows-msvc.zip`, extract, then:
+            ```powershell
+            .\install.ps1
+            .\bin\robotz-host.exe
+            ```
+
+            ## Runtime (not bundled)
+
+            - **Linux**: X11, `xdotool`, `wmctrl`, `xclip`
+            - **macOS**: `cliclick`, Accessibility permission
+            - **Windows**: UI Automation (built-in)

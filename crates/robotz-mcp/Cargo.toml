@@ -13,8 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 robotz-core.workspace = true
-robotz-automation = { path = "../robotz-automation" }
-robotz-browser = { path = "../robotz-browser" }
+robotz-toolset = { path = "../robotz-toolset" }
 anyhow.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
