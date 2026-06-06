@@ -46,7 +46,7 @@ codegen-units = 1
 lto = true
 strip = true
 
-# Pin matches openpiscis / CodeZ / agent-workbench (tag v0.8.41 on piscis-engine).
+# Pin matches openpiscis / CodeZ / agent-workbench (tag v0.8.42 on piscis-engine).
 # For local engine hacking, uncomment:
 # [patch."https://github.com/njbinbin-piscis/piscis-engine.git"]
 # piscis-kernel = { path = "../piscis-engine/piscis-kernel" }
