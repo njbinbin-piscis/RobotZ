@@ -1,27 +1,51 @@
-//! Windows UIA five-point calibration wizard (uses panel target coordinates).
+//! Screen / pointer calibration wizard for the RobotZ GUI host.
+//!
+//! - **All platforms**: five-point sampling via `desktop_automation` to measure
+//!   click drift; results shown in the panel and exported as JSON.
+//! - **Windows**: optional persist to `uia_calibration.json` so `uia.click`
+//!   applies the fitted transform automatically.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use robotz_automation::calibration;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 #[cfg(target_os = "windows")]
 use robotz_automation::calibration::{
-    build_fingerprint, calibration_file_path, fit_monitor_calibration, save_file, set_cached,
-    CalibrationFile, MonitorSnapshot,
+    build_fingerprint, calibration_file_path, fit_monitor_calibration, load_file, save_file,
+    set_cached, CalibrationFile, MonitorCalibration, MonitorSnapshot,
 };
-use serde_json::json;
-
 use crate::runner::ToolRunner;
 
 /// Indices on the 5×4 panel grid used as calibration anchors (corners + center).
 pub const CALIBRATION_TARGET_INDICES: [usize; 5] = [0, 4, 9, 14, 19];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClickBackend {
+    #[default]
+    /// Cross-platform `desktop_automation.click`.
+    Desktop = 0,
+    /// Windows `uia.click` (feeds the UIA calibration store).
+    Uia,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CalibrationSample {
+    pub index: usize,
+    pub grid_index: usize,
+    pub target: [i32; 2],
+    pub actual: [i32; 2],
+    pub error_px: [i32; 2],
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CalibrationWizard {
     pub step: usize,
+    pub backend: ClickBackend,
     pub targets: Vec<(i32, i32)>,
     pub actuals: Vec<(i32, i32)>,
+    pub samples: Vec<CalibrationSample>,
     pub monitor_index: usize,
     pub message: String,
     pub finished_rms: Option<f64>,
@@ -30,7 +54,8 @@ pub struct CalibrationWizard {
 impl CalibrationWizard {
     pub fn reset(&mut self) {
         *self = Self::default();
-        self.message = "Ready — press Start, then run each sample.".into();
+        self.backend = ClickBackend::Desktop;
+        self.message = "点击「开始五点校准」，然后在每个高亮靶心上执行采样。".into();
     }
 
     pub fn is_active(&self) -> bool {
@@ -40,71 +65,188 @@ impl CalibrationWizard {
     pub fn is_done(&self) -> bool {
         self.step > CALIBRATION_TARGET_INDICES.len()
     }
+
+    pub fn current_grid_index(&self) -> Option<usize> {
+        if !self.is_active() {
+            return None;
+        }
+        CALIBRATION_TARGET_INDICES.get(self.step - 1).copied()
+    }
 }
 
-pub fn calibration_supported() -> bool {
+/// Shown in the calibration sidebar.
+#[derive(Debug, Clone, Default)]
+pub struct CalibrationUiStatus {
+    pub summary: String,
+    pub monitors_lines: Vec<String>,
+    pub uia_valid: bool,
+    pub uia_rms_px: Option<f64>,
+    pub uia_file: String,
+}
+
+pub fn default_click_backend() -> ClickBackend {
+    ClickBackend::Desktop
+}
+
+pub fn uia_persist_supported() -> bool {
     cfg!(target_os = "windows")
 }
 
-#[cfg(target_os = "windows")]
-pub fn monitor_for_point(
-    monitors: &[MonitorSnapshot],
-    x: i32,
-    y: i32,
-) -> Option<usize> {
-    monitors
+pub fn sample_error(target: (i32, i32), actual: (i32, i32)) -> (i32, i32) {
+    (actual.0 - target.0, actual.1 - target.1)
+}
+
+pub fn wizard_rms(wizard: &CalibrationWizard) -> Option<f64> {
+    if wizard.targets.is_empty() {
+        return None;
+    }
+    let n = wizard.targets.len() as f64;
+    let sq: f64 = wizard
+        .targets
         .iter()
-        .find(|m| point_in_rect(x, y, m.rect))
-        .map(|m| m.index)
+        .zip(wizard.actuals.iter())
+        .map(|(t, a)| {
+            let dx = (a.0 - t.0) as f64;
+            let dy = (a.1 - t.1) as f64;
+            dx * dx + dy * dy
+        })
+        .sum();
+    Some((sq / n).sqrt())
 }
 
-#[cfg(not(target_os = "windows"))]
-pub fn monitor_for_point(_monitors: &[calibration::MonitorSnapshot], _x: i32, _y: i32) -> Option<usize> {
-    None
+/// Refresh monitor / UIA calibration status for the GUI (Windows fills real data).
+pub fn query_ui_status(app_data: &Path) -> CalibrationUiStatus {
+    #[cfg(target_os = "windows")]
+    {
+        calibration::refresh_cache(app_data);
+        let snap = calibration::current_snapshot();
+        let path = calibration_file_path(app_data);
+        let mut status = CalibrationUiStatus {
+            uia_file: path.display().to_string(),
+            ..Default::default()
+        };
+        for m in &snap.monitors {
+            status.monitors_lines.push(format!(
+                "显示器 {}: {}x{} @ ({},{}) DPI {}% {}",
+                m.index,
+                m.rect[2] - m.rect[0],
+                m.rect[3] - m.rect[1],
+                m.rect[0],
+                m.rect[1],
+                m.scale_percent,
+                if m.primary { "[主屏]" } else { "" }
+            ));
+        }
+        if let Some(file) = load_file(&path) {
+            if file.fingerprint == snap.fingerprint {
+                status.uia_valid = true;
+                status.uia_rms_px = file.monitors.first().map(|m| m.residual_rms_px);
+                status.summary = format!(
+                    "UIA 校准有效，RMS {:.2}px",
+                    status.uia_rms_px.unwrap_or(0.0)
+                );
+                return status;
+            }
+            status.summary = "UIA 校准文件已过期（分辨率/DPI/显示器变化）".into();
+            return status;
+        }
+        status.summary = "尚未保存 UIA 校准（Windows 可在采样后写入）".into();
+        status
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app_data;
+        CalibrationUiStatus {
+            summary: "使用五点采样测量点击偏差；结果可导出 JSON 报告。".into(),
+            ..Default::default()
+        }
+    }
 }
 
-#[allow(dead_code)]
-fn point_in_rect(x: i32, y: i32, rect: [i32; 4]) -> bool {
-    let [l, t, r, b] = rect;
-    x >= l && x < r && y >= t && y < b
-}
-
-/// Run one wizard step: click via `uia` without calibration, record actual cursor.
-pub fn run_sample(
+/// Sample one calibration point using the chosen click backend.
+pub fn run_calibration_sample(
     runner: &ToolRunner,
     wizard: &mut CalibrationWizard,
+    grid_index: usize,
     target: (i32, i32),
 ) -> Result<()> {
-    if !calibration_supported() {
-        anyhow::bail!("UIA calibration is only supported on Windows");
-    }
-
     let (x, y) = target;
-    let r = runner.call_sync(
-        "uia",
-        json!({
-            "action": "click",
-            "x": x,
-            "y": y,
-            "_skip_calibration": true
-        }),
-    )?;
-    if r.is_error {
-        anyhow::bail!("uia.click failed: {}", r.content);
+    match wizard.backend {
+        ClickBackend::Desktop => {
+            let r = runner.call_sync(
+                "desktop_automation",
+                json!({ "action": "click", "x": x, "y": y }),
+            )?;
+            if r.is_error {
+                anyhow::bail!("desktop_automation.click 失败: {}", r.content);
+            }
+        }
+        ClickBackend::Uia => {
+            if !uia_persist_supported() {
+                anyhow::bail!("UIA 点击仅支持 Windows");
+            }
+            let r = runner.call_sync(
+                "uia",
+                json!({
+                    "action": "click",
+                    "x": x,
+                    "y": y,
+                    "_skip_calibration": true
+                }),
+            )?;
+            if r.is_error {
+                anyhow::bail!("uia.click 失败: {}", r.content);
+            }
+        }
     }
 
-    std::thread::sleep(std::time::Duration::from_millis(120));
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let actual = read_cursor(runner).context("读取光标位置")?;
+    let err = sample_error(target, actual);
 
-    let actual = read_cursor(runner).context("read cursor after uia.click")?;
     wizard.targets.push(target);
     wizard.actuals.push(actual);
+    wizard.samples.push(CalibrationSample {
+        index: wizard.samples.len(),
+        grid_index,
+        target: [target.0, target.1],
+        actual: [actual.0, actual.1],
+        error_px: [err.0, err.1],
+    });
+
+    let rms = wizard_rms(wizard).unwrap_or(0.0);
     wizard.message = format!(
-        "Sample {}: target ({x},{y}) → actual ({},{})",
-        wizard.actuals.len(),
+        "采样 {}/{}：靶心 #{grid_index} 目标({x},{y}) → 实际({},{}) 偏差({},{}) RMS≈{rms:.1}px",
+        wizard.samples.len(),
+        CALIBRATION_TARGET_INDICES.len(),
         actual.0,
-        actual.1
+        actual.1,
+        err.0,
+        err.1
     );
     Ok(())
+}
+
+pub fn advance_after_sample(wizard: &mut CalibrationWizard) {
+    wizard.step += 1;
+    if wizard.step > CALIBRATION_TARGET_INDICES.len() {
+        wizard.finished_rms = wizard_rms(wizard);
+        wizard.message = format!(
+            "五点采样完成，RMS {:.2}px。可导出报告{}",
+            wizard.finished_rms.unwrap_or(0.0),
+            if uia_persist_supported() {
+                "或保存为 UIA 校准"
+            } else {
+                ""
+            }
+        );
+    } else if let Some(next) = wizard.current_grid_index() {
+        wizard.message = format!(
+            "步骤 {}/{}：请在面板高亮靶心 #{next} 上点击「采样此点」",
+            wizard.step,
+            CALIBRATION_TARGET_INDICES.len()
+        );
+    }
 }
 
 fn read_cursor(runner: &ToolRunner) -> Result<(i32, i32)> {
@@ -118,7 +260,7 @@ fn read_cursor(runner: &ToolRunner) -> Result<(i32, i32)> {
         "desktop_automation",
         json!({ "action": "get_cursor_position" }),
     )?;
-    parse_cursor(&r.content).ok_or_else(|| anyhow::anyhow!("parse cursor: {}", r.content))
+    parse_cursor(&r.content).ok_or_else(|| anyhow::anyhow!("无法解析光标: {}", r.content))
 }
 
 fn parse_cursor(content: &str) -> Option<(i32, i32)> {
@@ -132,25 +274,55 @@ fn parse_cursor(content: &str) -> Option<(i32, i32)> {
     Some((parts[0].trim().parse().ok()?, parts[1].trim().parse().ok()?))
 }
 
-/// Finalize fit and persist `uia_calibration.json` under [`crate::bench::host_data_dir`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PointerMeasurementReport {
+    pub generated_at: String,
+    pub platform: String,
+    pub backend: String,
+    pub residual_rms_px: f64,
+    pub samples: Vec<CalibrationSample>,
+}
+
+pub fn export_measurement_report(wizard: &CalibrationWizard, path: &Path) -> Result<()> {
+    if wizard.samples.is_empty() {
+        anyhow::bail!("尚无采样数据");
+    }
+    let report = PointerMeasurementReport {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        platform: std::env::consts::OS.into(),
+        backend: match wizard.backend {
+            ClickBackend::Desktop => "desktop_automation",
+            ClickBackend::Uia => "uia",
+        }
+        .into(),
+        residual_rms_px: wizard_rms(wizard).unwrap_or(0.0),
+        samples: wizard.samples.clone(),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
+    Ok(())
+}
+
+/// Persist UIA calibration on Windows (uses the same five samples).
 #[cfg(target_os = "windows")]
-pub fn finalize_wizard(wizard: &mut CalibrationWizard, app_data: &Path) -> Result<()> {
+pub fn save_uia_calibration(wizard: &mut CalibrationWizard, app_data: &Path) -> Result<()> {
     use calibration::windows_helpers;
 
     if wizard.targets.len() < 3 {
-        anyhow::bail!("need at least 3 samples, have {}", wizard.targets.len());
+        anyhow::bail!("至少需要 3 个采样点");
     }
 
     let virtual_screen = windows_helpers::virtual_screen_rect();
     let monitors = windows_helpers::enumerate_monitors_with_dpi();
-    let monitor_index = wizard.monitor_index;
     let monitor = monitors
         .iter()
-        .find(|m| m.index == monitor_index)
+        .find(|m| m.index == wizard.monitor_index)
         .or(monitors.first())
-        .context("no monitor for calibration")?;
+        .context("未找到显示器")?;
 
-    let entry = fit_monitor_calibration(
+    let entry: MonitorCalibration = fit_monitor_calibration(
         monitor.index,
         monitor.rect,
         &wizard.targets,
@@ -158,9 +330,8 @@ pub fn finalize_wizard(wizard: &mut CalibrationWizard, app_data: &Path) -> Resul
     );
     wizard.finished_rms = Some(entry.residual_rms_px);
 
-    let fingerprint = build_fingerprint(&virtual_screen, &monitors);
     let file = CalibrationFile {
-        fingerprint,
+        fingerprint: build_fingerprint(&virtual_screen, &monitors),
         monitors: vec![entry],
         version: 1,
     };
@@ -170,9 +341,8 @@ pub fn finalize_wizard(wizard: &mut CalibrationWizard, app_data: &Path) -> Resul
     calibration::refresh_cache(app_data);
     set_cached(file);
 
-    wizard.step = CALIBRATION_TARGET_INDICES.len() + 1;
     wizard.message = format!(
-        "Saved calibration to {} (RMS {:.2}px)",
+        "UIA 校准已保存到 {}（RMS {:.2}px）",
         path.display(),
         wizard.finished_rms.unwrap_or(0.0)
     );
@@ -180,6 +350,6 @@ pub fn finalize_wizard(wizard: &mut CalibrationWizard, app_data: &Path) -> Resul
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn finalize_wizard(_wizard: &mut CalibrationWizard, _app_data: &Path) -> Result<()> {
-    anyhow::bail!("UIA calibration is only supported on Windows")
+pub fn save_uia_calibration(_wizard: &mut CalibrationWizard, _app_data: &Path) -> Result<()> {
+    anyhow::bail!("UIA 校准持久化仅支持 Windows")
 }

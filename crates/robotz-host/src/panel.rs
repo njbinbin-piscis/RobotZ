@@ -8,14 +8,89 @@ use base64::Engine;
 use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use serde_json::json;
 
+use std::collections::HashMap;
+
 use crate::bench::{host_data_dir, run_benchmark, write_report, BenchOptions};
-use crate::calibrate::{
-    self, CalibrationWizard, CALIBRATION_TARGET_INDICES,
-};
+use crate::calibrate::{CalibrationUiStatus, CalibrationWizard, CALIBRATION_TARGET_INDICES};
+use crate::coords::{pointer_screen_physical, rect_screen_center};
 use crate::mcp_client::{find_robotz_mcp_binary, mcp_result_summary, McpSession};
 use crate::runner::ToolRunner;
 
-pub const WINDOW_TITLE: &str = "RobotZ Test Panel";
+pub const WINDOW_TITLE: &str = "RobotZ 屏幕校准与测试";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppTab {
+    #[default]
+    Calibration,
+    TestRange,
+    UiaDrag,
+    Calculator,
+    Advanced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UiaDropResult {
+    #[default]
+    Idle,
+    Success,
+    Fail,
+}
+
+#[derive(Debug, Clone)]
+pub struct UiaDragState {
+    pub ball_pos: (f32, f32),
+    pub ball_screen: Option<(i32, i32)>,
+    pub target_screen: Option<(i32, i32)>,
+    pub drop_result: UiaDropResult,
+    pub dragging: bool,
+    pub drag_offset: Vec2,
+}
+
+impl Default for UiaDragState {
+    fn default() -> Self {
+        Self {
+            ball_pos: (60.0, 120.0),
+            ball_screen: None,
+            target_screen: None,
+            drop_result: UiaDropResult::Idle,
+            dragging: false,
+            drag_offset: Vec2::ZERO,
+        }
+    }
+}
+
+impl UiaDragState {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalcOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CalculatorState {
+    pub display: String,
+    pub accumulator: Option<f64>,
+    pub pending_op: Option<CalcOp>,
+    pub fresh_entry: bool,
+    pub last_result: Option<f64>,
+    pub button_screen: HashMap<String, (i32, i32)>,
+}
+
+impl CalculatorState {
+    pub fn new() -> Self {
+        Self {
+            display: "0".into(),
+            ..Default::default()
+        }
+    }
+}
 
 const GRID_COLS: usize = 5;
 const GRID_ROWS: usize = 4;
@@ -53,7 +128,11 @@ pub struct PanelState {
     pub use_mcp: bool,
     pub mcp_status: String,
     pub cal_wizard: CalibrationWizard,
+    pub cal_ui_status: CalibrationUiStatus,
+    pub active_tab: AppTab,
     pub last_bench_report: Option<String>,
+    pub uia_drag: UiaDragState,
+    pub calculator: CalculatorState,
 }
 
 impl PanelState {
@@ -82,19 +161,20 @@ impl PanelApp {
             "MCP binary: {}",
             find_robotz_mcp_binary().display()
         );
-        state.cal_wizard.message = if calibrate::calibration_supported() {
-            "Windows: 5-point UIA calibration available.".into()
-        } else {
-            "UIA calibration requires Windows.".into()
-        };
-        Self {
+        state.active_tab = AppTab::Calibration;
+        state.cal_wizard.reset();
+        state.uia_drag.reset();
+        state.calculator = CalculatorState::new();
+        let mut app = Self {
             runner,
             mcp: Arc::new(McpSession::new(find_robotz_mcp_binary())),
             state,
-        }
+        };
+        app.refresh_calibration_status();
+        app
     }
 
-    fn run_tool(&mut self, name: &str, input: serde_json::Value, label: &str) {
+    pub(super) fn run_tool(&mut self, name: &str, input: serde_json::Value, label: &str) {
         if self.state.running_action {
             return;
         }
@@ -166,7 +246,33 @@ impl eframe::App for PanelApp {
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.heading("RobotZ Host");
+                ui.heading("RobotZ");
+                ui.separator();
+                ui.selectable_value(
+                    &mut self.state.active_tab,
+                    AppTab::Calibration,
+                    "屏幕校准",
+                );
+                ui.selectable_value(
+                    &mut self.state.active_tab,
+                    AppTab::TestRange,
+                    "操作测试",
+                );
+                ui.selectable_value(
+                    &mut self.state.active_tab,
+                    AppTab::UiaDrag,
+                    "UIA 拖拽",
+                );
+                ui.selectable_value(
+                    &mut self.state.active_tab,
+                    AppTab::Calculator,
+                    "计算器",
+                );
+                ui.selectable_value(
+                    &mut self.state.active_tab,
+                    AppTab::Advanced,
+                    "高级",
+                );
                 ui.separator();
                 if ui
                     .button("📷 Capture + grid")
@@ -201,22 +307,38 @@ impl eframe::App for PanelApp {
                     );
                 }
                 ui.separator();
-                ui.label(
-                    RichText::new("Use MCP / desktop_automation against this window — targets show physical pixel coords.")
-                        .small()
-                        .weak(),
-                );
+                let hint = match self.state.active_tab {
+                    AppTab::Calibration => "五点屏幕校准：侧栏引导采样，面板高亮靶心。",
+                    AppTab::UiaDrag => "拖动小球到目标区，或读取坐标后一次 drag 调用。",
+                    AppTab::Calculator => "左侧计算器：Agent 点击数字与运算符完成算术。",
+                    _ => "MCP / desktop_automation 可自动化本窗口。",
+                };
+                ui.label(RichText::new(hint).small().weak());
             });
         });
+
+        if self.state.active_tab == AppTab::Calibration {
+            egui::SidePanel::left("calibration")
+                .resizable(true)
+                .default_width(300.0)
+                .show(ctx, |ui| self.draw_calibration_sidebar(ui));
+        }
+
+        if self.state.active_tab == AppTab::Calculator {
+            egui::SidePanel::left("calculator")
+                .resizable(true)
+                .default_width(260.0)
+                .show(ctx, |ui| self.draw_calculator_sidebar(ui));
+        }
 
         egui::SidePanel::right("sidebar")
             .resizable(true)
             .default_width(280.0)
             .show(ctx, |ui| {
-                ui.heading("Tool console");
+                ui.heading("工具输出");
                 ui.separator();
 
-                ui.label("Last result");
+                ui.label("最近结果");
                 ui.add(
                     egui::TextEdit::multiline(&mut self.state.last_tool_message)
                         .desired_width(f32::INFINITY)
@@ -224,12 +346,66 @@ impl eframe::App for PanelApp {
                 );
 
                 if let Some((x, y)) = self.state.cursor_physical {
-                    ui.label(format!("Physical cursor: ({x}, {y})"));
+                    ui.label(format!("光标物理坐标: ({x}, {y})"));
                     if let Some(idx) = self.state.hover_target {
-                        ui.label(format!("Nearest target: #{idx}"));
+                        ui.label(format!("最近靶心: #{idx}"));
                     }
                 }
 
+                if self.state.active_tab == AppTab::UiaDrag {
+                    ui.separator();
+                    ui.heading("拖拽坐标");
+                    if let Some((x, y)) = self.state.uia_drag.ball_screen {
+                        ui.label(format!("小球中心: ({x}, {y})"));
+                    }
+                    if let Some((x, y)) = self.state.uia_drag.target_screen {
+                        ui.label(format!("目标中心: ({x}, {y})"));
+                    }
+                }
+
+                if self.state.active_tab == AppTab::Calculator {
+                    ui.separator();
+                    ui.heading("计算器");
+                    ui.label(format!("显示: {}", self.state.calculator.display));
+                    if let Some(r) = self.state.calculator.last_result {
+                        ui.label(format!("结果: {r}"));
+                    }
+                }
+
+                if self.state.active_tab == AppTab::TestRange {
+                ui.separator();
+                ui.heading("快捷操作");
+                ui.horizontal_wrapped(|ui| {
+                    for idx in 0..TARGET_COUNT.min(8) {
+                        if ui.button(format!("#{idx} click")).clicked() {
+                            if let Some(&(x, y)) = self.state.target_screen_coords.get(idx) {
+                                self.run_tool(
+                                    "desktop_automation",
+                                    json!({ "action": "click", "x": x, "y": y }),
+                                    &format!("click #{idx}"),
+                                );
+                            }
+                        }
+                    }
+                });
+                if ui.button("Type sample text into field").clicked() {
+                    self.run_tool(
+                        "desktop_automation",
+                        json!({ "action": "type_text", "text": "RobotZ keyboard test 123!" }),
+                        "type_text",
+                    );
+                }
+                if ui.button("Hotkey Ctrl+A").clicked() {
+                    self.run_tool(
+                        "desktop_automation",
+                        json!({ "action": "hotkey", "keys": ["ctrl", "a"] }),
+                        "hotkey",
+                    );
+                    self.state.hotkey_log = "Sent ctrl+a via tool".into();
+                }
+                }
+
+                if self.state.active_tab == AppTab::Advanced {
                 ui.separator();
                 ui.heading("MCP transport");
                 ui.label(RichText::new(&self.state.mcp_status).small());
@@ -295,104 +471,6 @@ impl eframe::App for PanelApp {
                 if let Some(ref msg) = self.state.last_bench_report {
                     ui.label(RichText::new(msg).small().weak());
                 }
-
-                ui.separator();
-                ui.heading("UIA calibration (Windows)");
-                ui.label(RichText::new(&self.state.cal_wizard.message).small());
-                if calibrate::calibration_supported() {
-                    if ui.button("Start 5-point wizard").clicked() {
-                        self.state.cal_wizard.reset();
-                        self.state.cal_wizard.step = 1;
-                        self.state.cal_wizard.message =
-                            "Step 1/5: run sample on target #0 (corner).".into();
-                    }
-                    if self.state.cal_wizard.is_active() {
-                        let step_idx = self.state.cal_wizard.step - 1;
-                        if step_idx < CALIBRATION_TARGET_INDICES.len() {
-                            let grid_idx = CALIBRATION_TARGET_INDICES[step_idx];
-                            if ui.button(format!("Run sample #{step_idx} (grid #{grid_idx})"))
-                                .clicked()
-                            {
-                                let target = self
-                                    .state
-                                    .calibrated_targets
-                                    .get(grid_idx)
-                                    .and_then(|o| *o)
-                                    .or_else(|| {
-                                        self.state.target_screen_coords.get(grid_idx).copied()
-                                    });
-                                if let Some(t) = target {
-                                    if let Err(e) =
-                                        calibrate::run_sample(&self.runner, &mut self.state.cal_wizard, t)
-                                    {
-                                        self.state.cal_wizard.message = e.to_string();
-                                    } else {
-                                        self.state.cal_wizard.step += 1;
-                                        if self.state.cal_wizard.step
-                                            > CALIBRATION_TARGET_INDICES.len()
-                                        {
-                                            if let Err(e) = calibrate::finalize_wizard(
-                                                &mut self.state.cal_wizard,
-                                                &host_data_dir(),
-                                            ) {
-                                                self.state.cal_wizard.message = e.to_string();
-                                            }
-                                        } else {
-                                            let next =
-                                                CALIBRATION_TARGET_INDICES[self.state.cal_wizard.step - 1];
-                                            self.state.cal_wizard.message = format!(
-                                                "Step {}/5: sample grid #{next}",
-                                                self.state.cal_wizard.step
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    self.state.cal_wizard.message =
-                                        "Calibrate grid target first (click it locally).".into();
-                                }
-                            }
-                        }
-                    }
-                    if ui.button("Clear saved calibration").clicked() {
-                        let path = robotz_automation::calibration::calibration_file_path(
-                            &host_data_dir(),
-                        );
-                        let _ = robotz_automation::calibration::delete_file(&path);
-                        robotz_automation::calibration::clear_cache();
-                        self.state.cal_wizard.reset();
-                        self.state.push_log("Calibration cleared", false);
-                    }
-                }
-
-                ui.separator();
-                ui.heading("Automation actions");
-                ui.horizontal_wrapped(|ui| {
-                    for idx in 0..TARGET_COUNT.min(8) {
-                        if ui.button(format!("#{idx} click")).clicked() {
-                            if let Some(&(x, y)) = self.state.target_screen_coords.get(idx) {
-                                self.run_tool(
-                                    "desktop_automation",
-                                    json!({ "action": "click", "x": x, "y": y }),
-                                    &format!("click #{idx}"),
-                                );
-                            }
-                        }
-                    }
-                });
-                if ui.button("Type sample text into field").clicked() {
-                    self.run_tool(
-                        "desktop_automation",
-                        json!({ "action": "type_text", "text": "RobotZ keyboard test 123!" }),
-                        "type_text",
-                    );
-                }
-                if ui.button("Hotkey Ctrl+A").clicked() {
-                    self.run_tool(
-                        "desktop_automation",
-                        json!({ "action": "hotkey", "keys": ["ctrl", "a"] }),
-                        "hotkey",
-                    );
-                    self.state.hotkey_log = "Sent ctrl+a via tool".into();
                 }
 
                 ui.separator();
@@ -431,22 +509,74 @@ impl eframe::App for PanelApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Mouse targets");
-            ui.label(
-                "Click targets locally or via desktop_automation / MCP. Green = clicked; yellow ring = cursor near target.",
-            );
+            if self.state.active_tab == AppTab::UiaDrag {
+                self.draw_uia_drag_central(ui);
+                return;
+            }
+            if self.state.active_tab == AppTab::Calculator {
+                self.draw_calculator_central(ui);
+                return;
+            }
+
+            match self.state.active_tab {
+                AppTab::Calibration => {
+                    ui.heading("五点校准靶场");
+                    ui.label(
+                        RichText::new(
+                            "① 侧栏点「开始五点校准」 ② 在本面板点击高亮靶心记录坐标 ③ 侧栏点「采样此点」",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+                AppTab::TestRange => {
+                    ui.heading("鼠标 / 键盘测试靶场");
+                    ui.label(
+                        RichText::new(
+                            "本地点击或经 desktop_automation / MCP 自动化。绿色=已点击；黄圈=光标靠近。",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+                AppTab::Advanced => {
+                    ui.heading("靶场预览");
+                    ui.label(
+                        RichText::new("配合右侧 MCP 与基准测试使用。")
+                            .small()
+                            .weak(),
+                    );
+                }
+                AppTab::UiaDrag | AppTab::Calculator => {}
+            }
 
             let spacing = 8.0;
-            let button_size = Vec2::new(88.0, 52.0);
+            let cal_mode = self.state.active_tab == AppTab::Calibration;
             self.state.target_screen_coords.clear();
 
             for row in 0..GRID_ROWS {
                 ui.horizontal(|ui| {
                     for col in 0..GRID_COLS {
                         let idx = row * GRID_COLS + col;
+                        let is_cal_anchor = CALIBRATION_TARGET_INDICES.contains(&idx);
+                        if cal_mode && !is_cal_anchor {
+                            self.state.target_screen_coords.push((0, 0));
+                            ui.add_space(72.0 + spacing);
+                            continue;
+                        }
+
+                        let button_size = if cal_mode {
+                            self.calibration_button_size(is_cal_anchor)
+                        } else {
+                            Vec2::new(88.0, 52.0)
+                        };
                         let label = format!("#{idx}");
                         let (rect, response) = ui.allocate_exact_size(button_size, Sense::click());
-                        let estimated = pointer_screen_physical(ctx, &response, rect);
+                        let estimated = pointer_screen_physical(
+                            ctx,
+                            rect,
+                            response.hover_pos(),
+                        );
                         let screen = self
                             .state
                             .calibrated_targets
@@ -458,26 +588,32 @@ impl eframe::App for PanelApp {
                         let clicked = self.state.clicked_targets.contains(&idx);
                         let near = self.state.hover_target == Some(idx);
 
-                        let is_cal_anchor = CALIBRATION_TARGET_INDICES.contains(&idx);
-                        let fill = if clicked {
-                            Color32::from_rgb(40, 120, 60)
-                        } else if is_cal_anchor {
-                            Color32::from_rgb(80, 60, 30)
+                        let (fill, stroke_color, stroke_w, _anchor) = if cal_mode {
+                            self.calibration_target_style(idx)
                         } else {
-                            Color32::from_rgb(45, 55, 75)
+                            let fill = if clicked {
+                                Color32::from_rgb(40, 120, 60)
+                            } else if is_cal_anchor {
+                                Color32::from_rgb(80, 60, 30)
+                            } else {
+                                Color32::from_rgb(45, 55, 75)
+                            };
+                            let stroke_color = if near {
+                                Color32::YELLOW
+                            } else {
+                                Color32::from_gray(100)
+                            };
+                            let stroke_w = if near { 3.0 } else { 1.0 };
+                            (fill, stroke_color, stroke_w, is_cal_anchor)
                         };
-                        let stroke = if near {
-                            Stroke::new(3.0, Color32::YELLOW)
-                        } else {
-                            Stroke::new(1.0, Color32::from_gray(100))
-                        };
+                        let stroke = Stroke::new(stroke_w, stroke_color);
 
                         ui.painter().rect(rect, 6.0, fill, stroke);
                         ui.painter().text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
                             &label,
-                            egui::FontId::proportional(16.0),
+                            egui::FontId::proportional(if cal_mode && is_cal_anchor { 18.0 } else { 16.0 }),
                             Color32::WHITE,
                         );
                         ui.painter().text(
@@ -499,12 +635,12 @@ impl eframe::App for PanelApp {
                                 }
                                 self.state.calibrated_targets[idx] = Some(c);
                                 self.state.push_log(
-                                    format!("Panel click #{idx} — calibrated cursor {c:?}"),
+                                    format!("面板点击 #{idx} — 光标 {c:?}"),
                                     false,
                                 );
                             } else {
                                 self.state.push_log(
-                                    format!("Panel click on #{idx} at {screen:?}"),
+                                    format!("面板点击 #{idx} 坐标 {screen:?}"),
                                     false,
                                 );
                             }
@@ -515,8 +651,12 @@ impl eframe::App for PanelApp {
                 ui.add_space(spacing);
             }
 
+            if self.state.active_tab != AppTab::TestRange {
+                return;
+            }
+
             ui.separator();
-            ui.heading("Drag test zone");
+            ui.heading("拖拽测试区");
             let (drag_rect, drag_resp) = ui.allocate_exact_size(Vec2::new(400.0, 80.0), Sense::drag());
             let drag_color = Color32::from_rgb(70, 50, 90);
             ui.painter().rect(
@@ -569,8 +709,8 @@ impl eframe::App for PanelApp {
             }
 
             ui.separator();
-            ui.heading("Keyboard test");
-            ui.label("Focus the field below, then use type_text / hotkey from the sidebar or an MCP client.");
+            ui.heading("键盘测试");
+            ui.label("聚焦下方输入框，使用侧栏或 MCP 的 type_text / hotkey。");
             ui.add(
                 egui::TextEdit::singleline(&mut self.state.keyboard_text)
                     .desired_width(f32::INFINITY)
@@ -601,22 +741,6 @@ impl eframe::App for PanelApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
     }
-}
-
-/// Best-effort physical pixels from egui pointer position (screen points × PPP).
-fn pointer_screen_physical(ctx: &egui::Context, response: &egui::Response, rect: Rect) -> (i32, i32) {
-    let ppp = ctx.pixels_per_point();
-    let pos = response
-        .hover_pos()
-        .or_else(|| ctx.input(|i| i.pointer.hover_pos()))
-        .unwrap_or(rect.center());
-    ((pos.x * ppp).round() as i32, (pos.y * ppp).round() as i32)
-}
-
-fn rect_screen_center(ctx: &egui::Context, rect: Rect) -> (i32, i32) {
-    let ppp = ctx.pixels_per_point();
-    let c = rect.center();
-    ((c.x * ppp).round() as i32, (c.y * ppp).round() as i32)
 }
 
 fn parse_cursor(content: &str) -> Option<(i32, i32)> {

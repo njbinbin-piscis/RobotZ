@@ -10,6 +10,7 @@
 
 pub mod download;
 pub mod manager;
+pub mod snapshot;
 pub mod tool;
 
 pub use manager::{create_browser_manager, BrowserManager, BrowserOptions, SharedBrowserManager};

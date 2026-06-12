@@ -18,7 +18,7 @@ can control the machine.
 | `robotz-browser` | Chrome-DevTools-Protocol web automation. |
 | `robotz-mcp` | MCP server binary (`rmcp`, stdio) exposing the tools to any MCP client. |
 | `robotz-toolset` | Shared tool registry used by the MCP server and host. |
-| `robotz-host` | Example host with a visual test panel (mouse / keyboard / capture demos). |
+| `robotz-host` | GUI 测试与屏幕校准宿主（egui 面板：五点校准、靶场、MCP、基准）。 |
 
 ## Run the MCP server
 
@@ -27,26 +27,40 @@ cargo run -p robotz-mcp            # full tool set
 cargo run -p robotz-mcp -- --readonly   # observation-only (screenshots, reads)
 ```
 
-## Run the example host (visual test panel)
+## Run the example host（GUI 屏幕校准与测试）
 
 ```bash
-cargo run -p robotz-host              # opens the RobotZ Test Panel window
-cargo run -p robotz-host -- tools     # print tool names and descriptions
-cargo run -p robotz-host -- inspect   # headless-friendly read-only smoke
-cargo run -p robotz-host -- mcp-demo  # spawn robotz-mcp and call tools over MCP
-cargo run -p robotz-host -- bench     # run benchmark suite → ~/.local/share/robotz-host/bench-latest.json
+cargo run -p robotz-host              # 打开 GUI（默认「屏幕校准」页）
+cargo run -p robotz-host -- tools     # 打印工具名与说明
+cargo run -p robotz-host -- inspect   # 无头冒烟（显示器 / 光标）
+cargo run -p robotz-host -- mcp-demo  # 子进程连接 robotz-mcp 并调用工具
+cargo run -p robotz-host -- bench     # 基准测试 → ~/.local/share/robotz-host/bench-latest.json
 ```
 
-The panel sidebar adds:
+### GUI 标签页
 
-- **MCP transport** — connect to `robotz-mcp` subprocess and route tool calls through the protocol
-- **Benchmark** — timing/accuracy suite written to `bench-latest.json`
-- **UIA calibration** (Windows) — five-point wizard using panel anchor targets (#0, #4, #9, #14, #19)
+| 标签 | 用途 |
+|------|------|
+| **屏幕校准** | 左侧向导 + 中央五点靶心；测量点击偏差、导出 JSON；Windows 可保存 UIA 校准 |
+| **操作测试** | 完整 5×4 靶场、拖拽区、键盘输入，配合右侧快捷操作 |
+| **UIA 拖拽** | 橙色小球拖入绿色目标区（移植自 openpiscis Debug）；标注物理坐标，支持一次 `drag` / `uia.drag_drop` |
+| **计算器** | 左侧简易计算器（0–9、+−×÷、=、C）；中央显示按键坐标表，供 Agent 点击验算 |
+| **高级** | MCP 子进程连接、基准测试 JSON |
 
-The panel shows a grid of targets with **physical pixel coordinates** (for
-`desktop_automation.click`), a drag zone, a keyboard field, and sidebar actions
-that invoke the same tools as `robotz-mcp`. Point your MCP client at
-`robotz-mcp` and automate this window to exercise end-to-end computer use.
+### 五点屏幕校准流程
+
+1. 打开 `robotz-host`，确认在 **屏幕校准** 页。
+2. 左侧点 **▶ 开始五点校准**。
+3. 在中央高亮靶心（#0、#4、#9、#14、#19）上 **用鼠标点击一次**，记录物理坐标。
+4. 左侧点 **◎ 采样此点（自动点击）** — 工具自动点击并读取实际光标位置，表格显示偏差。
+5. 重复 3–4 共五点；可 **导出测量报告 JSON**（`pointer-calibration-report.json`）。
+6. **Windows**：可选 **保存为 UIA 校准**（`uia_calibration.json`），供 `uia.click` 自动纠偏。  
+   **Linux / macOS**：可测量与导出报告，UIA 持久化仅 Windows。
+
+数据目录：`~/.local/share/robotz-host/`（Windows 为 `%LOCALAPPDATA%\robotz-host\`）。
+
+面板显示每个靶心的 **物理像素坐标**（供 `desktop_automation.click` 使用）。将 MCP 客户端指向
+`robotz-mcp` 可自动化本窗口，做端到端 computer-use 验证。
 
 **Linux**: requires an X11 session plus `xdotool`, `wmctrl`, and `xclip` (see
 Runtime dependencies below).

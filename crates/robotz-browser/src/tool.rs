@@ -66,15 +66,17 @@ impl Tool for BrowserTool {
          take screenshots (returned to Vision AI), execute JavaScript, manage tabs, \
          and interact with web content.\n\
          \n\
-         Element location workflow (recommended):\n\
-         1. `get_interactive_elements` — lists all clickable/typeable elements with tag, role, text, \
-            CSS selector, and center coordinates. Use to find selectors before interacting.\n\
-         2. `annotate_screenshot` — Set-of-Mark: captures a screenshot with numbered colored boxes \
-            overlaid on every interactive element, plus the element index table. Best used with a \
-            vision-capable LLM; say 'click element [3]' then use `click_coords` with the reported x/y.\n\
-         3. `click_coords` — click a specific x/y pixel coordinate (useful after annotate_screenshot).\n\
+         E2E workflow (recommended):\n\
+         1. `navigate` → `lock` → `snapshot` — get accessibility-style tree with refs (e1, e2…)\n\
+         2. Interact via `ref` (click/type/fill/hover/assert) or CSS `selector`\n\
+         3. `assert_url` / `assert_visible` / `assert_text` for verification; `screenshot` with save_path for evidence\n\
+         4. `unlock` when done\n\
          \n\
-         Fallback: use CSS `selector` param directly with `click`, `type_text`, etc."
+         Fallback element discovery:\n\
+         - `get_interactive_elements` — flat table with selectors and coordinates\n\
+         - `annotate_screenshot` — Set-of-Mark overlay for vision models → `click_coords`\n\
+         \n\
+         Static docs: prefer kernel `web_fetch`; use `browser` for JS/SPA/login/E2E."
     }
 
     fn input_schema(&self) -> Value {
@@ -86,11 +88,13 @@ impl Tool for BrowserTool {
                     "enum": [
                         "navigate", "go_back", "go_forward", "reload",
                         "click", "double_click", "right_click", "hover", "click_coords",
-                        "type_text", "clear", "press_key",
+                        "type_text", "fill", "clear", "press_key",
                         "screenshot", "annotate_screenshot", "get_interactive_elements",
+                        "snapshot", "lock", "unlock",
                         "get_content", "get_text", "get_attribute",
-                        "eval_js", "wait_for", "scroll",
+                        "eval_js", "wait_for", "wait_for_text", "scroll",
                         "select", "check", "uncheck",
+                        "assert_text", "assert_visible", "assert_url", "assert_title",
                         "list_tabs", "new_tab", "close_tab", "switch_tab",
                         "get_cookies", "set_cookie", "clear_cookies",
                         "get_url", "get_title", "detect_challenge",
@@ -105,7 +109,11 @@ impl Tool for BrowserTool {
                 },
                 "selector": {
                     "type": "string",
-                    "description": "CSS selector for element actions"
+                    "description": "CSS selector for element actions (alternative to ref)"
+                },
+                "ref": {
+                    "type": "string",
+                    "description": "Opaque element ref from snapshot (e.g. e3). Preferred for E2E after snapshot."
                 },
                 "text": {
                     "type": "string",
@@ -176,6 +184,27 @@ impl Tool for BrowserTool {
                 "y": {
                     "type": "integer",
                     "description": "Y coordinate for click_coords action"
+                },
+                "interactive": {
+                    "type": "boolean",
+                    "description": "For snapshot: only include interactive elements (default false)"
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "For snapshot: max tree depth (default 20)"
+                },
+                "compact": {
+                    "type": "boolean",
+                    "description": "For snapshot: omit indentation (default false)"
+                },
+                "include_diff": {
+                    "type": "boolean",
+                    "description": "For snapshot: note changes vs previous snapshot (default false)"
+                },
+                "match_mode": {
+                    "type": "string",
+                    "enum": ["substring", "regex"],
+                    "description": "For assert_url/assert_title: match mode (default substring)"
                 }
             },
             "required": ["action"]
@@ -205,20 +234,29 @@ impl Tool for BrowserTool {
             "hover" => self.hover(&input).await,
             "click_coords" => self.click_coords(&input).await,
             "type_text" => self.type_text(&input).await,
+            "fill" => self.fill(&input).await,
             "clear" => self.clear(&input).await,
             "press_key" => self.press_key(&input).await,
             "screenshot" => self.screenshot(&input).await,
             "annotate_screenshot" => self.annotate_screenshot(&input).await,
             "get_interactive_elements" => self.get_interactive_elements(&input).await,
+            "snapshot" => self.snapshot(&input).await,
+            "lock" => self.lock_session(&input).await,
+            "unlock" => self.unlock_session(&input).await,
             "get_content" => self.get_content(&input).await,
             "get_text" => self.get_text(&input).await,
             "get_attribute" => self.get_attribute(&input).await,
             "eval_js" => self.eval_js(&input).await,
             "wait_for" => self.wait_for(&input).await,
+            "wait_for_text" => self.wait_for_text(&input).await,
             "scroll" => self.scroll(&input).await,
             "select" => self.select(&input).await,
             "check" => self.set_checked(&input, true).await,
             "uncheck" => self.set_checked(&input, false).await,
+            "assert_text" => self.assert_text(&input).await,
+            "assert_visible" => self.assert_visible(&input).await,
+            "assert_url" => self.assert_url(&input).await,
+            "assert_title" => self.assert_title(&input).await,
             "list_tabs" => self.list_tabs().await,
             "new_tab" => self.new_tab(&input).await,
             "close_tab" => self.close_tab(&input).await,
@@ -305,9 +343,8 @@ impl BrowserTool {
             None => return Ok(ToolResult::err("navigate requires url")),
         };
 
-        let mut mgr = self.manager.lock().await;
-        let page = mgr.active_page().await?;
-        drop(mgr);
+        let (page, tab_id) = self.page_ctx(input).await?;
+        crate::snapshot::invalidate_tab(&tab_id);
 
         let _ = page
             .goto(&url)
@@ -366,10 +403,9 @@ impl BrowserTool {
         Ok(ToolResult::ok("Navigated forward"))
     }
 
-    async fn reload(&self, _input: &Value) -> Result<ToolResult> {
-        let mut mgr = self.manager.lock().await;
-        let page = mgr.active_page().await?;
-        drop(mgr);
+    async fn reload(&self, input: &Value) -> Result<ToolResult> {
+        let (page, tab_id) = self.page_ctx(input).await?;
+        crate::snapshot::invalidate_tab(&tab_id);
         page.reload().await.map_err(|e| anyhow::anyhow!("{}", e))?;
         let _ = self
             .wait_until_navigation_ready(&page, DEFAULT_TIMEOUT_MS)
@@ -380,10 +416,8 @@ impl BrowserTool {
     // ─── Element interaction ──────────────────────────────────────────────────
 
     async fn click(&self, input: &Value) -> Result<ToolResult> {
-        let selector = self.require_selector(input)?;
-        let mut mgr = self.manager.lock().await;
-        let page = mgr.active_page().await?;
-        drop(mgr);
+        let (page, tab_id) = self.page_ctx(input).await?;
+        let selector = self.resolve_target(input, &tab_id).await?;
 
         let element = page
             .find_element(&selector)
@@ -458,15 +492,12 @@ impl BrowserTool {
     }
 
     async fn type_text(&self, input: &Value) -> Result<ToolResult> {
-        let selector = self.require_selector(input)?;
+        let (page, tab_id) = self.page_ctx(input).await?;
+        let selector = self.resolve_target(input, &tab_id).await?;
         let text = match input["text"].as_str() {
             Some(t) => t.to_string(),
             None => return Ok(ToolResult::err("type_text requires text")),
         };
-
-        let mut mgr = self.manager.lock().await;
-        let page = mgr.active_page().await?;
-        drop(mgr);
 
         let element = page
             .find_element(&selector)
@@ -1368,6 +1399,8 @@ impl BrowserTool {
             None => return Ok(ToolResult::err("switch_tab requires tab_id")),
         };
         let mut mgr = self.manager.lock().await;
+        let current = mgr.current_tab_id();
+        crate::snapshot::assert_not_locked_for_switch(&current).await?;
         mgr.switch_tab(&tab_id)?;
         Ok(ToolResult::ok(format!("Switched to tab: {}", tab_id)))
     }
@@ -1623,13 +1656,228 @@ impl BrowserTool {
         }
     }
 
+    // ─── Snapshot / lock / assert ───────────────────────────────────────────
+
+    async fn snapshot(&self, input: &Value) -> Result<ToolResult> {
+        let (page, tab_id) = self.page_ctx(input).await?;
+        let opts = crate::snapshot::SnapshotOptions {
+            interactive: input["interactive"].as_bool().unwrap_or(false),
+            max_depth: input["max_depth"].as_u64().unwrap_or(20) as u32,
+            compact: input["compact"].as_bool().unwrap_or(false),
+            selector: input["selector"].as_str().map(|s| s.to_string()),
+            include_diff: input["include_diff"].as_bool().unwrap_or(false),
+        };
+        let text = crate::snapshot::capture_snapshot(&page, &tab_id, opts).await?;
+        Ok(ToolResult::ok(text))
+    }
+
+    async fn lock_session(&self, input: &Value) -> Result<ToolResult> {
+        let tab_id = if let Some(t) = input["tab_id"].as_str() {
+            t.to_string()
+        } else {
+            let mgr = self.manager.lock().await;
+            mgr.current_tab_id()
+        };
+        crate::snapshot::lock_tab(&tab_id).await?;
+        Ok(ToolResult::ok(format!(
+            "Browser locked to tab '{}'. Call unlock when automation is complete.",
+            tab_id
+        )))
+    }
+
+    async fn unlock_session(&self, _input: &Value) -> Result<ToolResult> {
+        crate::snapshot::unlock_tab().await?;
+        Ok(ToolResult::ok("Browser unlocked"))
+    }
+
+    async fn fill(&self, input: &Value) -> Result<ToolResult> {
+        let (page, tab_id) = self.page_ctx(input).await?;
+        let selector = self.resolve_target(input, &tab_id).await?;
+        let text = match input["text"].as_str() {
+            Some(t) => t.to_string(),
+            None => return Ok(ToolResult::err("fill requires text")),
+        };
+        let js = format!(
+            r#"
+            const el = document.querySelector({});
+            if (!el) throw new Error('Element not found');
+            el.focus();
+            if ('value' in el) el.value = '';
+            el.value = {};
+            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            true
+            "#,
+            Self::js_str(&selector),
+            Self::js_str(&text)
+        );
+        page.evaluate(js)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(ToolResult::ok(format!("Filled: {}", selector)))
+    }
+
+    async fn assert_text(&self, input: &Value) -> Result<ToolResult> {
+        let expected = match input["text"].as_str() {
+            Some(t) => t,
+            None => return Ok(ToolResult::err("assert_text requires text")),
+        };
+        let (page, tab_id) = self.page_ctx(input).await?;
+        let haystack = if input.get("selector").is_some() || input.get("ref").is_some() {
+            let selector = self.resolve_target(input, &tab_id).await?;
+            let js = format!(
+                "document.querySelector({})?.innerText || ''",
+                Self::js_str(&selector)
+            );
+            page.evaluate(js.as_str())
+                .await
+                .ok()
+                .and_then(|r| r.into_value::<String>().ok())
+                .unwrap_or_default()
+        } else {
+            page.evaluate("document.body?.innerText || ''")
+                .await
+                .ok()
+                .and_then(|r| r.into_value::<String>().ok())
+                .unwrap_or_default()
+        };
+        if haystack.contains(expected) {
+            Ok(ToolResult::ok(format!("PASS: text contains '{}'", expected)))
+        } else {
+            Ok(ToolResult::err(format!(
+                "FAIL: expected text '{}' not found",
+                expected
+            )))
+        }
+    }
+
+    async fn assert_visible(&self, input: &Value) -> Result<ToolResult> {
+        let (page, tab_id) = self.page_ctx(input).await?;
+        let selector = self.resolve_target(input, &tab_id).await?;
+        if page.find_element(&selector).await.is_ok() {
+            Ok(ToolResult::ok(format!("PASS: visible '{}'", selector)))
+        } else {
+            Ok(ToolResult::err(format!(
+                "FAIL: element not visible/found '{}'",
+                selector
+            )))
+        }
+    }
+
+    async fn assert_url(&self, input: &Value) -> Result<ToolResult> {
+        let expected = match input["text"].as_str().or(input["url"].as_str()) {
+            Some(t) => t,
+            None => return Ok(ToolResult::err("assert_url requires text or url")),
+        };
+        let (page, _tab_id) = self.page_ctx(input).await?;
+        let current = page
+            .evaluate("window.location.href")
+            .await
+            .ok()
+            .and_then(|r| r.into_value::<String>().ok())
+            .unwrap_or_default();
+        let regex = input["match_mode"].as_str() == Some("regex");
+        let ok = if regex {
+            regex::Regex::new(expected)
+                .map(|re| re.is_match(&current))
+                .unwrap_or(false)
+        } else {
+            current.contains(expected)
+        };
+        if ok {
+            Ok(ToolResult::ok(format!("PASS: URL matches '{}'", expected)))
+        } else {
+            Ok(ToolResult::err(format!(
+                "FAIL: URL '{}' does not match '{}'",
+                current, expected
+            )))
+        }
+    }
+
+    async fn assert_title(&self, input: &Value) -> Result<ToolResult> {
+        let expected = match input["text"].as_str() {
+            Some(t) => t,
+            None => return Ok(ToolResult::err("assert_title requires text")),
+        };
+        let (page, _tab_id) = self.page_ctx(input).await?;
+        let title = page
+            .evaluate("document.title")
+            .await
+            .ok()
+            .and_then(|r| r.into_value::<String>().ok())
+            .unwrap_or_default();
+        let regex = input["match_mode"].as_str() == Some("regex");
+        let ok = if regex {
+            regex::Regex::new(expected)
+                .map(|re| re.is_match(&title))
+                .unwrap_or(false)
+        } else {
+            title.contains(expected)
+        };
+        if ok {
+            Ok(ToolResult::ok(format!("PASS: title matches '{}'", expected)))
+        } else {
+            Ok(ToolResult::err(format!(
+                "FAIL: title '{}' does not match '{}'",
+                title, expected
+            )))
+        }
+    }
+
+    async fn wait_for_text(&self, input: &Value) -> Result<ToolResult> {
+        let expected = match input["text"].as_str() {
+            Some(t) => t.to_string(),
+            None => return Ok(ToolResult::err("wait_for_text requires text")),
+        };
+        let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(DEFAULT_TIMEOUT_MS);
+        let start = std::time::Instant::now();
+        loop {
+            let result = self.assert_text(input).await?;
+            if !result.is_error {
+                return Ok(result);
+            }
+            if start.elapsed().as_millis() as u64 >= timeout_ms {
+                return Ok(ToolResult::err(format!(
+                    "Timeout waiting for text '{}'",
+                    expected
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    async fn page_ctx(&self, input: &Value) -> Result<(Arc<chromiumoxide::Page>, String)> {
+        let mut mgr = self.manager.lock().await;
+        let tab_id_param = input["tab_id"].as_str();
+        if tab_id_param.is_some() {
+            let current = mgr.current_tab_id();
+            crate::snapshot::assert_not_locked_for_switch(&current).await?;
+        }
+        let page = mgr
+            .page_for_tab(tab_id_param)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tab_id = tab_id_param
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| mgr.current_tab_id());
+        Ok((page, tab_id))
+    }
+
+    async fn resolve_target(&self, input: &Value, tab_id: &str) -> Result<String> {
+        if let Some(ref_id) = input["ref"].as_str() {
+            let entry = crate::snapshot::resolve_ref(tab_id, ref_id).await?;
+            return Ok(entry.selector);
+        }
+        self.require_selector(input)
+    }
 
     fn require_selector(&self, input: &Value) -> Result<String> {
         match input["selector"].as_str() {
             Some(s) => Ok(s.to_string()),
             None => Err(anyhow::anyhow!(
-                "This action requires a 'selector' parameter (CSS selector)"
+                "This action requires 'selector' or 'ref' (from snapshot)"
             )),
         }
     }

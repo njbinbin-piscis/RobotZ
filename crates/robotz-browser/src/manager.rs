@@ -275,6 +275,21 @@ impl BrowserManager {
         self.get_or_create_page(&tab_id).await
     }
 
+    /// Resolve a page by optional tab id (honours `tab_id` tool param).
+    pub async fn page_for_tab(&mut self, tab_id: Option<&str>) -> Result<Arc<Page>> {
+        match tab_id {
+            Some(id) if !id.is_empty() => self.get_or_create_page(id).await,
+            _ => self.active_page().await,
+        }
+    }
+
+    /// Current active tab id (defaults to `"default"`).
+    pub fn current_tab_id(&self) -> String {
+        self.active_tab
+            .clone()
+            .unwrap_or_else(|| "default".to_string())
+    }
+
     /// List all open tabs
     pub fn list_tabs(&self) -> Vec<String> {
         self.pages.keys().cloned().collect()

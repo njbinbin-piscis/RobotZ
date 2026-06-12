@@ -2,9 +2,13 @@
 
 pub mod bench;
 pub mod calibrate;
+pub mod calculator_panel;
+pub mod calibration_panel;
+pub mod coords;
 pub mod mcp_client;
 pub mod panel;
 pub mod runner;
+pub mod uia_drag_panel;
 
 pub use bench::{host_data_dir, run_benchmark, write_report, BenchOptions, BenchmarkReport};
 pub use calibrate::{CalibrationWizard, CALIBRATION_TARGET_INDICES};
