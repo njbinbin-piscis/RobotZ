@@ -13,8 +13,9 @@ use serde_json::json;
 
 #[cfg(target_os = "windows")]
 use robotz_automation::calibration::{
-    build_fingerprint, calibration_file_path, fit_monitor_calibration, load_file, save_file,
-    set_cached, CalibrationFile, MonitorCalibration, MonitorSnapshot,
+    self, build_fingerprint, calibration_file_path, current_snapshot, fit_monitor_calibration,
+    load_file, refresh_cache, save_file, set_cached, CalibrationFile, MonitorCalibration,
+    MonitorSnapshot,
 };
 use crate::runner::ToolRunner;
 
