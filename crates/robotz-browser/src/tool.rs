@@ -11,6 +11,8 @@ use robotz_core::{ImageData, Tool, ToolContext, ToolResult};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +24,71 @@ use uuid::Uuid;
 const DEFAULT_TIMEOUT_MS: u64 = 15000;
 const MAX_CONTENT_BYTES: usize = 50 * 1024; // 50 KB
 const DOWNLOAD_POLL_MS: u64 = 400;
+/// Longest edge (px) of a viewport/element screenshot sent to a vision model.
+const SCREENSHOT_MAX_EDGE: f64 = 1568.0;
+/// Longest edge (px) for `full_page` screenshots.
+const SCREENSHOT_FULL_PAGE_MAX_EDGE: f64 = 2000.0;
+/// Page height (CSS px) captured by `full_page`; taller pages are truncated.
+const FULL_PAGE_MAX_HEIGHT: f64 = 6000.0;
+/// Settle delay before an automatic post-action screenshot.
+const AUTO_SHOT_SETTLE_MS: u64 = 250;
+const JPEG_QUALITY: i64 = 75;
+
+/// Last auto-screenshot hash per tab, used to skip identical frames.
+static LAST_SHOT_HASH: Lazy<std::sync::Mutex<HashMap<String, u64>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Scale factor so that the longest edge of `w`x`h` fits `max_edge` (never upscales).
+fn fit_scale(w: f64, h: f64, max_edge: f64) -> f64 {
+    let longest = w.max(h);
+    if longest <= 0.0 || longest <= max_edge {
+        1.0
+    } else {
+        max_edge / longest
+    }
+}
+
+/// Actions after which an automatic screenshot is useful (they change what is visible).
+fn is_visual_action(action: &str) -> bool {
+    matches!(
+        action,
+        "navigate"
+            | "go_back"
+            | "go_forward"
+            | "reload"
+            | "click"
+            | "double_click"
+            | "right_click"
+            | "hover"
+            | "click_coords"
+            | "type_text"
+            | "fill"
+            | "clear"
+            | "press_key"
+            | "scroll"
+            | "select"
+            | "check"
+            | "uncheck"
+            | "new_tab"
+            | "switch_tab"
+    )
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut h = DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+struct Shot {
+    bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+    /// Captured area in CSS px (what click coordinates refer to).
+    css_w: f64,
+    css_h: f64,
+    truncated: bool,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,7 +130,7 @@ impl Tool for BrowserTool {
 
     fn description(&self) -> &str {
         "Control a Chrome browser via CDP. Navigate pages, click elements, type text, \
-         take screenshots (returned to Vision AI), execute JavaScript, manage tabs, \
+         take screenshots (viewport, full page, single element via ref/selector, or x/y/width/height region; downscaled to <=1568px; returned to Vision AI), execute JavaScript, manage tabs, \
          and interact with web content.\n\
          \n\
          E2E workflow (recommended):\n\
@@ -141,11 +208,27 @@ impl Tool for BrowserTool {
                 },
                 "full_page": {
                     "type": "boolean",
-                    "description": "Capture full page screenshot (default: false)"
+                    "description": "Capture full page screenshot (default: false). Capped at 6000 CSS px height; pass ref/selector to capture a single element instead."
                 },
                 "save_path": {
                     "type": "string",
-                    "description": "For screenshot: optional absolute file path to persist the captured image to disk (e.g. '<workspace>/.piscis/screenshots/browser_<timestamp>.jpg'). The file is written BEFORE the tool returns, so the caller can immediately reference it via `app_control(action=\"artifact_submit\", path=save_path, artifact_type=\"image\")`. If omitted, no file is written and the image is returned only as base64. (Also used by download_file to set the target location.)"
+                    "description": "For screenshot: absolute file path to persist the image (e.g. '<workspace>/.agentz/screenshots/browser_<timestamp>.jpg'). Written BEFORE the tool returns. If omitted, explicit screenshots are auto-saved to '<workspace>/.agentz/screenshots/' (disable with save=false). (Also used by download_file to set the target location.)"
+                },
+                "save": {
+                    "type": "boolean",
+                    "description": "For screenshot: set false to skip auto-saving to .agentz/screenshots (default true)"
+                },
+                "width": {
+                    "type": "integer",
+                    "description": "For screenshot: region width in CSS px (with x, y, height) to capture only that viewport region"
+                },
+                "height": {
+                    "type": "integer",
+                    "description": "For screenshot: region height in CSS px (with x, y, width)"
+                },
+                "auto_screenshot": {
+                    "type": "boolean",
+                    "description": "Attach a compressed viewport screenshot after visual actions (navigate/click/type/scroll...). Normally enabled by the host for vision models; identical consecutive frames are skipped."
                 },
                 "wait_condition": {
                     "type": "string",
@@ -215,7 +298,14 @@ impl Tool for BrowserTool {
         false
     }
 
-    async fn call(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+    async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolResult> {
+        let res = self.call_inner(input.clone(), ctx).await?;
+        Ok(self.attach_auto_screenshot(&input, res).await)
+    }
+}
+
+impl BrowserTool {
+    async fn call_inner(&self, input: Value, _ctx: &ToolContext) -> Result<ToolResult> {
         let action = match input["action"].as_str() {
             Some(a) => a,
             None => return Ok(ToolResult::err("Missing required parameter: action")),
@@ -237,7 +327,7 @@ impl Tool for BrowserTool {
             "fill" => self.fill(&input).await,
             "clear" => self.clear(&input).await,
             "press_key" => self.press_key(&input).await,
-            "screenshot" => self.screenshot(&input).await,
+            "screenshot" => self.screenshot(&input, _ctx).await,
             "annotate_screenshot" => self.annotate_screenshot(&input).await,
             "get_interactive_elements" => self.get_interactive_elements(&input).await,
             "snapshot" => self.snapshot(&input).await,
@@ -273,9 +363,7 @@ impl Tool for BrowserTool {
             _ => Ok(ToolResult::err(format!("Unknown action: {}", action))),
         }
     }
-}
 
-impl BrowserTool {
     // ─── Browser lifecycle ────────────────────────────────────────────────────
 
     async fn launch_browser(&self, input: &Value) -> Result<ToolResult> {
@@ -344,7 +432,7 @@ impl BrowserTool {
         };
 
         let (page, tab_id) = self.page_ctx(input).await?;
-        crate::snapshot::invalidate_tab(&tab_id);
+        crate::snapshot::invalidate_tab(&tab_id).await;
 
         let _ = page
             .goto(&url)
@@ -405,7 +493,7 @@ impl BrowserTool {
 
     async fn reload(&self, input: &Value) -> Result<ToolResult> {
         let (page, tab_id) = self.page_ctx(input).await?;
-        crate::snapshot::invalidate_tab(&tab_id);
+        crate::snapshot::invalidate_tab(&tab_id).await;
         page.reload().await.map_err(|e| anyhow::anyhow!("{}", e))?;
         let _ = self
             .wait_until_navigation_ready(&page, DEFAULT_TIMEOUT_MS)
@@ -586,27 +674,139 @@ impl BrowserTool {
 
     // ─── Screenshot ───────────────────────────────────────────────────────────
 
-    async fn screenshot(&self, input: &Value) -> Result<ToolResult> {
-        let full_page = input["full_page"].as_bool().unwrap_or(false);
-        let mut mgr = self.manager.lock().await;
-        let page = mgr.active_page().await?;
-        drop(mgr);
+    /// Capture a downscaled JPEG. `region` is `(x, y, w, h)` in *page* CSS px;
+    /// `None` captures the current viewport (or the whole page when `full_page`).
+    async fn capture_shot(
+        &self,
+        page: &chromiumoxide::Page,
+        full_page: bool,
+        region: Option<(f64, f64, f64, f64)>,
+    ) -> Result<Shot> {
+        let metrics: Value = page
+            .evaluate(
+                "JSON.stringify({w:window.innerWidth,h:window.innerHeight,\
+                 sx:window.scrollX,sy:window.scrollY,\
+                 sw:Math.max(document.documentElement.scrollWidth,window.innerWidth),\
+                 sh:Math.max(document.documentElement.scrollHeight,window.innerHeight)})",
+            )
+            .await
+            .ok()
+            .and_then(|r| r.into_value::<String>().ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(Value::Null);
+        let f = |k: &str, d: f64| metrics[k].as_f64().unwrap_or(d);
 
-        // Use CDP screenshot command directly
+        let mut truncated = false;
+        let (x, y, w, h, max_edge, beyond) = if let Some((x, y, w, h)) = region {
+            (x, y, w, h, SCREENSHOT_MAX_EDGE, true)
+        } else if full_page {
+            let h = f("sh", 720.0);
+            if h > FULL_PAGE_MAX_HEIGHT {
+                truncated = true;
+            }
+            (
+                0.0,
+                0.0,
+                f("sw", 1280.0),
+                h.min(FULL_PAGE_MAX_HEIGHT),
+                SCREENSHOT_FULL_PAGE_MAX_EDGE,
+                true,
+            )
+        } else {
+            (f("sx", 0.0), f("sy", 0.0), f("w", 1280.0), f("h", 720.0), SCREENSHOT_MAX_EDGE, false)
+        };
+        let w = w.max(1.0);
+        let h = h.max(1.0);
+        let scale = fit_scale(w, h, max_edge);
+
         let params = chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotParams {
             format: Some(chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Jpeg),
-            quality: Some(75),
-            capture_beyond_viewport: Some(full_page),
+            quality: Some(JPEG_QUALITY),
+            capture_beyond_viewport: Some(beyond),
+            clip: Some(chromiumoxide::cdp::browser_protocol::page::Viewport {
+                x,
+                y,
+                width: w,
+                height: h,
+                scale,
+            }),
             ..Default::default()
         };
-
-        let png_bytes = page
+        let bytes = page
             .screenshot(params)
             .await
             .map_err(|e| anyhow::anyhow!("Screenshot failed: {}", e))?;
+        Ok(Shot {
+            bytes,
+            width: (w * scale).round() as u32,
+            height: (h * scale).round() as u32,
+            css_w: w,
+            css_h: h,
+            truncated,
+        })
+    }
 
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-        let size_kb = png_bytes.len() / 1024;
+    /// Page-coordinate rect (x, y, w, h) of an element, scrolled into view first.
+    async fn element_region(
+        &self,
+        page: &chromiumoxide::Page,
+        selector: &str,
+    ) -> Result<(f64, f64, f64, f64)> {
+        let js = format!(
+            "(()=>{{const e=document.querySelector({});if(!e)return null;\
+             e.scrollIntoView({{block:'center',inline:'center'}});\
+             const r=e.getBoundingClientRect();\
+             return JSON.stringify([r.left+window.scrollX,r.top+window.scrollY,r.width,r.height]);}})()",
+            Self::js_str(selector)
+        );
+        let raw = page
+            .evaluate(js)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?
+            .into_value::<String>()
+            .map_err(|_| anyhow::anyhow!("Element '{}' not found", selector))?;
+        let v: Vec<f64> = serde_json::from_str(&raw)?;
+        if v.len() != 4 || v[2] < 1.0 || v[3] < 1.0 {
+            return Err(anyhow::anyhow!("Element '{}' has no visible area", selector));
+        }
+        Ok((v[0], v[1], v[2], v[3]))
+    }
+
+    async fn screenshot(&self, input: &Value, ctx: &ToolContext) -> Result<ToolResult> {
+        let full_page = input["full_page"].as_bool().unwrap_or(false);
+        let (page, tab_id) = self.page_ctx(input).await?;
+
+        // Target: element (ref/selector) > explicit region > viewport/full page.
+        let mut target_note = String::new();
+        let region = if input["ref"].as_str().is_some() || input["selector"].as_str().is_some() {
+            let selector = self.resolve_target(input, &tab_id).await?;
+            target_note = format!("\nElement: {selector}");
+            Some(self.element_region(&page, &selector).await?)
+        } else if let (Some(x), Some(y), Some(w), Some(h)) = (
+            input["x"].as_f64(),
+            input["y"].as_f64(),
+            input["width"].as_f64(),
+            input["height"].as_f64(),
+        ) {
+            // Region coordinates are viewport-relative (same space as click_coords).
+            let off: Value = page
+                .evaluate("JSON.stringify([window.scrollX,window.scrollY])")
+                .await
+                .ok()
+                .and_then(|r| r.into_value::<String>().ok())
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(Value::Null);
+            let sx = off[0].as_f64().unwrap_or(0.0);
+            let sy = off[1].as_f64().unwrap_or(0.0);
+            target_note = format!("\nRegion: x={x} y={y} w={w} h={h}");
+            Some((x + sx, y + sy, w, h))
+        } else {
+            None
+        };
+
+        let shot = self.capture_shot(&page, full_page && region.is_none(), region).await?;
+        let size_kb = shot.bytes.len() / 1024;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&shot.bytes);
 
         let url = page
             .evaluate("window.location.href")
@@ -621,40 +821,98 @@ impl BrowserTool {
             .and_then(|r| r.into_value::<String>().ok())
             .unwrap_or_default();
 
-        // ── Opt-in persistence: write the encoded bytes to `save_path` ──
-        // Without this, the screenshot lives only in the LLM's tool result as
-        // a base64 blob — there is no file to reference as an artifact. The
-        // result message explicitly tells the caller whether the file was
-        // written so the agent can chain into `app_control(action=\"artifact_submit\",\n        // path=save_path, artifact_type=\"image\")`.
-        let save_note = if let Some(out_path) = input["save_path"]
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let path = std::path::Path::new(out_path);
-            let (ok, message) = match std::fs::create_dir_all(
-                path.parent().unwrap_or_else(|| std::path::Path::new(".")),
-            ) {
-                Err(e) => (false, format!("could not create parent directory: {e}")),
-                Ok(()) => match std::fs::write(path, &png_bytes) {
-                    Ok(()) => (true, out_path.to_string()),
-                    Err(e) => (false, format!("write failed: {e}")),
-                },
-            };
-            if ok {
-                format!("\nSaved to disk: {message} ({} KB). You MUST now call `app_control(action=\"artifact_submit\", artifact_name=\"<short label>\", path=\"{message}\", artifact_type=\"image\", content_summary=\"<1-line description>\")` so the file appears in the user's Artifacts panel.", size_kb)
-            } else {
-                format!("\nWARNING: failed to save screenshot to '{}': {}. The base64 image is still returned inline.", out_path, message)
+        // Persist: explicit save_path, else default `.agentz/screenshots/` (opt out with save=false).
+        let explicit = input["save_path"].as_str().map(str::trim).filter(|s| !s.is_empty());
+        let auto_save = explicit.is_none() && input["save"].as_bool().unwrap_or(true);
+        let out_path: Option<PathBuf> = match explicit {
+            Some(p) => Some(PathBuf::from(p)),
+            None if auto_save => Some(ctx.workspace_root.join(".agentz").join("screenshots").join(
+                format!("browser_{}.jpg", chrono_stamp()),
+            )),
+            None => None,
+        };
+        let save_note = match out_path {
+            Some(path) => {
+                let res = match std::fs::create_dir_all(
+                    path.parent().unwrap_or_else(|| Path::new(".")),
+                ) {
+                    Err(e) => Err(format!("could not create parent directory: {e}")),
+                    Ok(()) => std::fs::write(&path, &shot.bytes).map_err(|e| format!("write failed: {e}")),
+                };
+                match res {
+                    Ok(()) if explicit.is_some() => format!(
+                        "\nSaved to disk: {} ({} KB). You MUST now call `app_control(action=\"artifact_submit\", artifact_name=\"<short label>\", path=\"{}\", artifact_type=\"image\", content_summary=\"<1-line description>\")` so the file appears in the user's Artifacts panel.",
+                        path.display(), size_kb, path.display()
+                    ),
+                    Ok(()) => format!("\nSaved to disk: {} ({} KB).", path.display(), size_kb),
+                    Err(e) => format!(
+                        "\nWARNING: failed to save screenshot to '{}': {}. The image is still returned inline.",
+                        path.display(), e
+                    ),
+                }
             }
+            None => String::new(),
+        };
+
+        let trunc = if shot.truncated {
+            format!("\nNote: page taller than {FULL_PAGE_MAX_HEIGHT} CSS px; truncated. Use scroll or ref/selector for the rest.")
         } else {
             String::new()
         };
-
         Ok(ToolResult::ok(format!(
-            "Screenshot captured: {} KB\nURL: {}\nTitle: {}\nFull page: {}{}",
-            size_kb, url, title, full_page, save_note
+            "Screenshot captured: {} KB, image {}x{} px (covers {:.0}x{:.0} CSS px)\nURL: {}\nTitle: {}\nFull page: {}{}{}{}",
+            size_kb, shot.width, shot.height, shot.css_w, shot.css_h, url, title, full_page, target_note, trunc, save_note
         ))
         .with_image(ImageData::jpeg(b64)))
+    }
+
+    /// Append a compressed viewport screenshot to the result of a visual action when
+    /// `auto_screenshot` is true. Skips identical consecutive frames per tab.
+    async fn attach_auto_screenshot(&self, input: &Value, mut res: ToolResult) -> ToolResult {
+        let action = input["action"].as_str().unwrap_or("");
+        if res.is_error
+            || res.image.is_some()
+            || input["auto_screenshot"].as_bool() != Some(true)
+            || !is_visual_action(action)
+        {
+            return res;
+        }
+        if !matches!(action, "navigate" | "go_back" | "go_forward" | "reload" | "new_tab") {
+            tokio::time::sleep(Duration::from_millis(AUTO_SHOT_SETTLE_MS)).await;
+        }
+        let (page, tab_id) = {
+            let mut mgr = self.manager.lock().await;
+            let tab_id = mgr.current_tab_id();
+            match mgr.active_page().await {
+                Ok(p) => (p, tab_id),
+                Err(_) => return res,
+            }
+        };
+        let shot = match self.capture_shot(&page, false, None).await {
+            Ok(s) => s,
+            Err(e) => {
+                res.content.push_str(&format!("\n[auto-screenshot failed: {e}]"));
+                return res;
+            }
+        };
+        let hash = hash_bytes(&shot.bytes);
+        let unchanged = {
+            let mut map = LAST_SHOT_HASH.lock().unwrap_or_else(|e| e.into_inner());
+            map.insert(tab_id, hash) == Some(hash)
+        };
+        if unchanged {
+            res.content.push_str("\n[auto-screenshot: page visually unchanged since last frame]");
+        } else {
+            res.content.push_str(&format!(
+                "\n[auto-screenshot: {}x{} px viewport, {} KB]",
+                shot.width,
+                shot.height,
+                shot.bytes.len() / 1024
+            ));
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&shot.bytes);
+            res.image = Some(ImageData::jpeg(b64));
+        }
+        res
     }
 
     // ─── Element discovery ────────────────────────────────────────────────────
@@ -903,16 +1161,9 @@ impl BrowserTool {
             .unwrap_or_else(|_| "[]".to_string());
         let elements: Vec<Value> = serde_json::from_str(&json_str).unwrap_or_default();
 
-        // Capture screenshot with overlay visible
-        let params = chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotParams {
-            format: Some(chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Jpeg),
-            quality: Some(80),
-            ..Default::default()
-        };
-        let img_bytes = page
-            .screenshot(params)
-            .await
-            .map_err(|e| anyhow::anyhow!("Screenshot failed: {}", e))?;
+        // Capture screenshot with overlay visible (downscaled; cx/cy in the table stay CSS px)
+        let shot = self.capture_shot(&page, false, None).await?;
+        let img_bytes = shot.bytes;
 
         // Remove overlay immediately
         let _ = page
@@ -1862,6 +2113,7 @@ impl BrowserTool {
         let tab_id = tab_id_param
             .map(|s| s.to_string())
             .unwrap_or_else(|| mgr.current_tab_id());
+        crate::snapshot::take_lock_loss(&tab_id).await?;
         Ok((page, tab_id))
     }
 
@@ -2063,5 +2315,47 @@ impl BrowserTool {
             tokio::time::sleep(Duration::from_millis(800)).await;
         }
         Ok(false)
+    }
+}
+
+fn chrono_stamp() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("{ms}")
+}
+
+#[cfg(test)]
+mod screenshot_tests {
+    use super::*;
+
+    #[test]
+    fn fit_scale_never_upscales() {
+        assert_eq!(fit_scale(800.0, 600.0, 1568.0), 1.0);
+        assert_eq!(fit_scale(0.0, 0.0, 1568.0), 1.0);
+    }
+
+    #[test]
+    fn fit_scale_caps_longest_edge() {
+        let s = fit_scale(3136.0, 1000.0, 1568.0);
+        assert!((s - 0.5).abs() < 1e-9);
+        let s = fit_scale(1000.0, 6000.0, 2000.0);
+        assert!((6000.0 * s - 2000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn visual_actions_exclude_reads() {
+        assert!(is_visual_action("click"));
+        assert!(is_visual_action("navigate"));
+        assert!(!is_visual_action("get_text"));
+        assert!(!is_visual_action("screenshot"));
+        assert!(!is_visual_action("eval_js"));
+    }
+
+    #[test]
+    fn hash_detects_identical_frames() {
+        assert_eq!(hash_bytes(b"abc"), hash_bytes(b"abc"));
+        assert_ne!(hash_bytes(b"abc"), hash_bytes(b"abd"));
     }
 }

@@ -17,6 +17,9 @@ const DEFAULT_MAX_DEPTH: u32 = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefEntry {
+    /// Navigation generation of the tab when the snapshot that produced this ref was captured.
+    #[serde(default)]
+    pub generation: u64,
     pub selector: String,
     pub role: String,
     pub name: String,
@@ -31,40 +34,93 @@ struct TabSnapshotState {
     refs: HashMap<String, RefEntry>,
     last_tree: String,
     locked: bool,
+    /// Bumped by every navigation or reload of the tab. Refs from an older generation are stale.
+    generation: u64,
 }
 
+#[derive(Default)]
 struct SnapshotStore {
     tabs: HashMap<String, TabSnapshotState>,
     locked_tab: Option<String>,
-}
-
-impl Default for SnapshotStore {
-    fn default() -> Self {
-        Self {
-            tabs: HashMap::new(),
-            locked_tab: None,
-        }
-    }
+    /// Tab whose lock was dropped by a navigation. Reported once on that tab's next action.
+    lost_lock: Option<String>,
 }
 
 static SNAPSHOT_STORE: Lazy<Arc<RwLock<SnapshotStore>>> =
     Lazy::new(|| Arc::new(RwLock::new(SnapshotStore::default())));
 
-pub fn invalidate_tab(tab_id: &str) {
-    let store = SNAPSHOT_STORE.clone();
-    let tab_id = tab_id.to_string();
-    tokio::spawn(async move {
-        let mut s = store.write().await;
-        s.tabs.remove(&tab_id);
-        if s.locked_tab.as_deref() == Some(tab_id.as_str()) {
-            s.locked_tab = None;
-        }
-    });
+/// Start a new page generation for `tab_id` before a navigation or reload. Awaited by the
+/// caller, so no snapshot or ref lookup can interleave with the change. Refs from earlier
+/// generations are kept (marked stale) so their use fails with an explicit error. A lock on the
+/// tab is released and remembered so the next action reports it.
+pub async fn invalidate_tab(tab_id: &str) {
+    let mut guard = SNAPSHOT_STORE.write().await;
+    let s = &mut *guard;
+    let state = s.tabs.entry(tab_id.to_string()).or_default();
+    state.generation += 1;
+    state.locked = false;
+    state.last_tree.clear();
+    if s.locked_tab.as_deref() == Some(tab_id) {
+        s.locked_tab = None;
+        s.lost_lock = Some(tab_id.to_string());
+    }
+}
+
+/// Fail once if a navigation released the lock on `tab_id`. Returns `Ok` afterwards.
+pub async fn take_lock_loss(tab_id: &str) -> Result<()> {
+    let mut s = SNAPSHOT_STORE.write().await;
+    if s.lost_lock.as_deref() == Some(tab_id) {
+        s.lost_lock = None;
+        return Err(anyhow!(
+            "Browser lock on tab '{}' was released because the page navigated. Call lock again before locked actions.",
+            tab_id
+        ));
+    }
+    Ok(())
+}
+
+/// Current page generation of `tab_id` (0 when the tab has never been seen).
+pub async fn tab_generation(tab_id: &str) -> u64 {
+    SNAPSHOT_STORE
+        .read()
+        .await
+        .tabs
+        .get(tab_id)
+        .map(|t| t.generation)
+        .unwrap_or(0)
+}
+
+/// Store a finished snapshot only if the tab is still on the generation it started in.
+/// A navigation during capture makes the refs describe a page that is gone, so they are dropped.
+pub async fn commit_snapshot(
+    tab_id: &str,
+    started_generation: u64,
+    refs: HashMap<String, RefEntry>,
+    tree: String,
+) -> Result<()> {
+    let mut s = SNAPSHOT_STORE.write().await;
+    let state = s.tabs.entry(tab_id.to_string()).or_default();
+    if state.generation != started_generation {
+        return Err(anyhow!(
+            "The page navigated while the snapshot was being captured. Call snapshot again."
+        ));
+    }
+    let generation = state.generation;
+    state.refs = refs
+        .into_iter()
+        .map(|(k, mut v)| {
+            v.generation = generation;
+            (k, v)
+        })
+        .collect();
+    state.last_tree = tree;
+    Ok(())
 }
 
 pub async fn lock_tab(tab_id: &str) -> Result<()> {
     let mut s = SNAPSHOT_STORE.write().await;
     s.locked_tab = Some(tab_id.to_string());
+    s.lost_lock = None;
     s.tabs.entry(tab_id.to_string()).or_default().locked = true;
     Ok(())
 }
@@ -94,16 +150,21 @@ pub async fn assert_not_locked_for_switch(current_tab: &str) -> Result<()> {
 
 pub async fn resolve_ref(tab_id: &str, ref_id: &str) -> Result<RefEntry> {
     let s = SNAPSHOT_STORE.read().await;
-    s.tabs
-        .get(tab_id)
-        .and_then(|t| t.refs.get(ref_id))
-        .cloned()
-        .ok_or_else(|| {
-            anyhow!(
-                "Unknown ref '{}'. Call snapshot first to refresh the ref map.",
-                ref_id
-            )
-        })
+    let unknown = || {
+        anyhow!(
+            "Unknown ref '{}'. Call snapshot first to refresh the ref map.",
+            ref_id
+        )
+    };
+    let tab = s.tabs.get(tab_id).ok_or_else(unknown)?;
+    let entry = tab.refs.get(ref_id).ok_or_else(unknown)?;
+    if entry.generation != tab.generation {
+        return Err(anyhow!(
+            "Ref '{}' belongs to an earlier page state; the tab navigated since that snapshot. Call snapshot again.",
+            ref_id
+        ));
+    }
+    Ok(entry.clone())
 }
 
 pub async fn ref_bounding_box(tab_id: &str, ref_id: &str) -> Result<(f64, f64, f64, f64)> {
@@ -274,6 +335,8 @@ pub async fn capture_snapshot(page: &Page, tab_id: &str, opts: SnapshotOptions) 
 }})()"#
     );
 
+    // Generation before the page is read; a navigation during the read makes the result stale.
+    let started_generation = tab_generation(tab_id).await;
     let val = page
         .evaluate(js.as_str())
         .await
@@ -305,6 +368,7 @@ pub async fn capture_snapshot(page: &Page, tab_id: &str, opts: SnapshotOptions) 
             ref_map.insert(
                 ref_id.clone(),
                 RefEntry {
+                    generation: 0,
                     selector: item
                         .get("selector")
                         .and_then(|v| v.as_str())
@@ -356,14 +420,75 @@ pub async fn capture_snapshot(page: &Page, tab_id: &str, opts: SnapshotOptions) 
         }
     }
 
-    {
-        let mut s = SNAPSHOT_STORE.write().await;
-        let state = s.tabs.entry(tab_id.to_string()).or_default();
-        state.refs = ref_map;
-        state.last_tree = tree;
-    }
+    commit_snapshot(tab_id, started_generation, ref_map, tree).await?;
 
     Ok(output)
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    fn entry(selector: &str) -> RefEntry {
+        RefEntry {
+            generation: 0,
+            selector: selector.into(),
+            role: "button".into(),
+            name: "Go".into(),
+            rect_x: 0.0,
+            rect_y: 0.0,
+            rect_width: 1.0,
+            rect_height: 1.0,
+        }
+    }
+
+    fn refs(selector: &str) -> HashMap<String, RefEntry> {
+        HashMap::from([("e1".to_string(), entry(selector))])
+    }
+
+    #[tokio::test]
+    async fn ref_from_before_navigation_is_rejected_explicitly() {
+        let tab = "gen-test-stale-ref";
+        let started = tab_generation(tab).await;
+        commit_snapshot(tab, started, refs("#go"), "tree".into()).await.unwrap();
+        assert_eq!(resolve_ref(tab, "e1").await.unwrap().selector, "#go");
+
+        invalidate_tab(tab).await;
+        let err = resolve_ref(tab, "e1").await.unwrap_err().to_string();
+        assert!(err.contains("earlier page state"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn navigation_during_capture_discards_the_snapshot() {
+        let tab = "gen-test-capture-race";
+        let started = tab_generation(tab).await;
+        invalidate_tab(tab).await; // navigation happens while the page is being read
+        let err = commit_snapshot(tab, started, refs("#old"), "old".into())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("navigated while"), "{err}");
+        assert!(resolve_ref(tab, "e1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn lock_released_by_navigation_is_reported_once() {
+        let tab = "gen-test-lock-loss";
+        lock_tab(tab).await.unwrap();
+        invalidate_tab(tab).await;
+        let first = take_lock_loss(tab).await.unwrap_err().to_string();
+        assert!(first.contains("released because the page navigated"), "{first}");
+        assert!(take_lock_loss(tab).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn fresh_snapshot_after_navigation_resolves() {
+        let tab = "gen-test-recover";
+        invalidate_tab(tab).await;
+        let started = tab_generation(tab).await;
+        commit_snapshot(tab, started, refs("#new"), "new".into()).await.unwrap();
+        assert_eq!(resolve_ref(tab, "e1").await.unwrap().selector, "#new");
+    }
 }
 
 pub async fn get_ref_map_json(tab_id: &str) -> Value {

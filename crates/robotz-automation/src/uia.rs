@@ -31,7 +31,8 @@ impl Tool for UiaTool {
          - Always specify window_title to narrow the search scope \
          - Use annotate_elements to get a labeled map of all controls in a window \
          - For text input fields, use 'type' action (not 'click' then 'type') \
-         - send_hotkey supports: ctrl+c, ctrl+v, alt+f4, win+d, ctrl+shift+esc, etc."
+         - send_hotkey supports: ctrl+c, ctrl+v, alt+f4, win+d, ctrl+shift+esc, etc. It requires window_title \
+           and the target window must already be in the foreground (call activate_window first)."
     }
 
     fn input_schema(&self) -> Value {
@@ -145,7 +146,7 @@ impl Tool for UiaTool {
             None => return Ok(ToolResult::err("Missing required parameter: action")),
         };
 
-        match action {
+        let result = match action {
             // Discovery
             "list_windows" => self.list_windows(),
             "find" => self.find_element(&input),
@@ -185,7 +186,15 @@ impl Tool for UiaTool {
             "smart_find" => self.smart_find(&input, ctx).await,
             "annotate_elements" => self.annotate_elements(&input, ctx).await,
             _ => Ok(ToolResult::err(format!("Unknown action: {}", action))),
+        };
+        // Only successful injections advance the agent-input baseline. A refused action must not
+        // mark the time, or it would mask the user input that caused the refusal.
+        if input_guard::INJECTING_ACTIONS.contains(&action)
+            && matches!(&result, Ok(r) if !r.is_error)
+        {
+            input_guard::mark_agent_input();
         }
+        result
     }
 }
 
@@ -1014,23 +1023,9 @@ impl UiaTool {
             matcher = matcher.classname(class);
         }
 
-        match matcher.find_first() {
-            Ok(element) => {
-                element
-                    .send_keys(text, 10)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                Ok(ToolResult::ok("Typed text into element"))
-            }
-            Err(_) => {
-                let root2 = automation
-                    .get_root_element()
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                root2
-                    .send_keys(text, 10)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                Ok(ToolResult::ok("Typed text to focused element"))
-            }
-        }
+        // Fail closed: never fall back to global keyboard input at the focused window.
+        let target = matcher.find_first().ok();
+        type_text_into(target, text, 10)
     }
 
     fn send_hotkey(&self, input: &Value) -> Result<ToolResult> {
@@ -1093,6 +1088,16 @@ impl UiaTool {
             )));
         }
 
+        // Fail closed: the hotkey must name its target window, which must be in the foreground,
+        // with no protected window and no user takeover. Nothing is sent otherwise.
+        if let Some(msg) = hotkey_target_refusal(input) {
+            return Ok(ToolResult::err(msg));
+        }
+        let expected = input_guard::Target::from_hwnd(self.find_window_hwnd(input)?);
+        if let Err(msg) = input_guard::check(Some(&expected)) {
+            return Ok(ToolResult::err(msg));
+        }
+
         unsafe {
             // Press all keys
             for &vk in &vkeys {
@@ -1120,15 +1125,21 @@ impl UiaTool {
             None => return Ok(ToolResult::err("Missing parameter: keys")),
         };
 
+        // Keys are only sent to a named target element. There is no focused-window fallback.
+        if input["name"].as_str().is_none()
+            && input["class_name"].as_str().is_none()
+            && input["automation_id"].as_str().is_none()
+        {
+            return Ok(ToolResult::err(
+                "send_keys refused: give name, class_name or automation_id of the target element (keys are never sent to the focused window)",
+            ));
+        }
         use uiautomation::UIAutomation;
         let automation = UIAutomation::new().map_err(|e| anyhow::anyhow!("{}", e))?;
-        let root = automation
-            .get_root_element()
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        // send_keys to focused element (root acts as global keyboard input)
-        root.send_keys(keys, 50)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        Ok(ToolResult::ok(format!("Sent keys: {}", keys)))
+        let root = self.get_search_root(&automation, input)?;
+        let matcher = self.build_matcher(&automation, root, input, 3000);
+        let target = matcher.find_first().ok();
+        type_text_into(target, keys, 50)
     }
 
     // ─── State Actions ────────────────────────────────────────────────────────
@@ -1668,5 +1679,418 @@ impl UiaTool {
                 }
             }
         }
+    }
+}
+
+/// Target of a keyboard request. Abstracted so the fail-closed decision can be
+/// unit-tested without a live UIA tree.
+trait TypeTextTarget {
+    /// True when the element can accept keyboard focus and is not a password field.
+    fn accepts_keyboard_input(&self) -> bool;
+    /// Verify the target window is foreground and no user takeover happened. Must pass before any input.
+    fn preflight(&self) -> Result<(), String>;
+    /// Send `text` to the element with `interval_ms` between keys. Only called after `preflight`.
+    fn send_text(&self, text: &str, interval_ms: u64) -> Result<()>;
+}
+
+impl TypeTextTarget for uiautomation::UIElement {
+    fn accepts_keyboard_input(&self) -> bool {
+        // Unknown password state is treated as a password field (fail closed).
+        self.is_keyboard_focusable().unwrap_or(false) && !self.is_password().unwrap_or(true)
+    }
+
+    fn preflight(&self) -> Result<(), String> {
+        let target = input_guard::target_from_element(self)?;
+        input_guard::check(Some(&target))
+    }
+
+    fn send_text(&self, text: &str, interval_ms: u64) -> Result<()> {
+        self.send_keys(text, interval_ms)
+            .map_err(|e| anyhow::anyhow!("{}", e))
+    }
+}
+
+/// Refusal for a hotkey that names no target window. Hotkeys are never sent to whichever
+/// window happens to be focused, so `window_title` (or `name`) is required.
+fn hotkey_target_refusal(input: &Value) -> Option<&'static str> {
+    // Same precedence as find_window_hwnd (name, then window_title). An empty title counts as
+    // missing: a partial match on "" would hit the first visible window.
+    let title = input["name"].as_str().or(input["window_title"].as_str());
+    if title.map(str::trim).is_some_and(|t| !t.is_empty()) {
+        None
+    } else {
+        Some("send_hotkey refused: give window_title (or name) of the target window (hotkeys are never sent to the focused window)")
+    }
+}
+
+/// Fail-closed core of keyboard input. `target` is `None` when the element could not be
+/// resolved. Input is only sent to a resolved, keyboard-focusable, non-password element whose
+/// window is in the foreground, with no protected window and no user takeover.
+fn type_text_into<T: TypeTextTarget>(target: Option<T>, text: &str, interval_ms: u64) -> Result<ToolResult> {
+    let target = match target {
+        Some(t) => t,
+        None => {
+            return Ok(ToolResult::err(
+                "refused: target element not found (no input sent to the focused window)",
+            ))
+        }
+    };
+    if !target.accepts_keyboard_input() {
+        return Ok(ToolResult::err(
+            "refused: target element is not keyboard-focusable or is a password field (no input sent)",
+        ));
+    }
+    if let Err(msg) = target.preflight() {
+        return Ok(ToolResult::err(msg));
+    }
+    target.send_text(text, interval_ms)?;
+    Ok(ToolResult::ok("Sent input to target element"))
+}
+
+/// Keyboard-injection guards for the Windows UIA tool.
+///
+/// Every injected keystroke passes `check` (foreground window equals the target, no protected
+/// window in front, no user takeover since the last successful agent input). Successful
+/// injections call `mark_agent_input`, so later user input can be told apart from our own.
+pub(crate) mod input_guard {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, GA_ROOT,
+    };
+
+    /// Actions that inject input into the desktop. Only these advance the agent-input baseline.
+    pub(crate) const INJECTING_ACTIONS: &[&str] = &[
+        "click",
+        "double_click",
+        "right_click",
+        "hover",
+        "scroll",
+        "drag_drop",
+        "type",
+        "send_hotkey",
+        "send_keys",
+        "expand",
+        "collapse",
+        "select",
+        "check",
+        "uncheck",
+    ];
+
+    /// GetTickCount value of the most recent successful injection by this tool; 0 means none yet.
+    static LAST_AGENT_INPUT_TICK: AtomicU32 = AtomicU32::new(0);
+    /// Input observed within this window after an injection is attributed to that injection.
+    const INJECTION_ECHO_GRACE_MS: u32 = 100;
+    /// Window classes that must never receive injected input (credential prompts).
+    const PROTECTED_WINDOW_CLASSES: &[&str] =
+        &["Credential Dialog Xaml Host", "CredUIBrokerWindow"];
+
+    /// Identity of the window an action intends to act on.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct Target {
+        /// Top-level window handle (0 when unknown).
+        pub root_hwnd: isize,
+        /// Owning process id (0 when unknown).
+        pub pid: u32,
+    }
+
+    impl Target {
+        pub(crate) fn from_hwnd(hwnd: HWND) -> Self {
+            if hwnd.0.is_null() {
+                return Target { root_hwnd: 0, pid: 0 };
+            }
+            let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+            Target {
+                root_hwnd: root.0 as isize,
+                pid: pid_of(root),
+            }
+        }
+    }
+
+    fn pid_of(hwnd: HWND) -> u32 {
+        let mut pid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        }
+        pid
+    }
+
+    /// Resolve the top-level window of a UIA element. Refuses when neither handle nor pid is known.
+    pub(crate) fn target_from_element(el: &uiautomation::UIElement) -> Result<Target, String> {
+        let from_handle = match el.get_native_window_handle() {
+            Ok(h) if !h.is_invalid() => {
+                let raw: isize = h.into();
+                Target::from_hwnd(HWND(raw as *mut std::ffi::c_void))
+            }
+            _ => Target { root_hwnd: 0, pid: 0 },
+        };
+        let pid = if from_handle.pid != 0 {
+            from_handle.pid
+        } else {
+            el.get_process_id().unwrap_or(0)
+        };
+        if from_handle.root_hwnd == 0 && pid == 0 {
+            return Err("refused: cannot identify the target window (no input sent)".to_string());
+        }
+        Ok(Target {
+            root_hwnd: from_handle.root_hwnd,
+            pid,
+        })
+    }
+
+    struct Foreground {
+        hwnd: isize,
+        pid: u32,
+        class: String,
+    }
+
+    fn foreground() -> Foreground {
+        let fg = unsafe { GetForegroundWindow() };
+        if fg.0.is_null() {
+            return Foreground {
+                hwnd: 0,
+                pid: 0,
+                class: String::new(),
+            };
+        }
+        let mut buf = [0u16; 256];
+        let n = unsafe { GetClassNameW(fg, &mut buf) };
+        let len = (n.max(0) as usize).min(buf.len());
+        Foreground {
+            hwnd: fg.0 as isize,
+            pid: pid_of(fg),
+            class: String::from_utf16_lossy(&buf[..len]),
+        }
+    }
+
+    /// Tick of the last user keyboard or mouse input, or None if the OS will not say.
+    fn last_user_input_tick() -> Option<u32> {
+        let mut info = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        if unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+            Some(info.dwTime)
+        } else {
+            None
+        }
+    }
+
+    /// Record that this tool just injected input. Call only after a successful injection.
+    pub(crate) fn mark_agent_input() {
+        let now = unsafe { GetTickCount() }.max(1);
+        LAST_AGENT_INPUT_TICK.store(now, Ordering::SeqCst);
+    }
+
+    /// Preflight for one injection. `expected` is the window the action targets; `None` means global input.
+    pub(crate) fn check(expected: Option<&Target>) -> Result<(), String> {
+        let fg = foreground();
+        let user_tick = last_user_input_tick()
+            .ok_or_else(|| "refused: cannot read last input time (no input sent)".to_string())?;
+        decide(
+            fg.hwnd,
+            fg.pid,
+            &fg.class,
+            expected,
+            user_tick,
+            LAST_AGENT_INPUT_TICK.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Pure decision behind `check`, separated so the policy can be unit-tested.
+    pub(crate) fn decide(
+        fg_hwnd: isize,
+        fg_pid: u32,
+        fg_class: &str,
+        expected: Option<&Target>,
+        user_tick: u32,
+        agent_tick: u32,
+    ) -> Result<(), String> {
+        if fg_hwnd == 0 {
+            return Err("focus lost: no foreground window; stopped without sending input".to_string());
+        }
+        if let Some(t) = expected {
+            let same_window = if t.root_hwnd != 0 {
+                fg_hwnd == t.root_hwnd
+            } else {
+                t.pid != 0 && fg_pid == t.pid
+            };
+            if !same_window {
+                return Err(
+                    "focus lost: the target window is not in the foreground; stopped without sending input. Call activate_window on the target first."
+                        .to_string(),
+                );
+            }
+        }
+        if PROTECTED_WINDOW_CLASSES.contains(&fg_class) {
+            return Err(
+                "refused: a credential or secure window is in the foreground (no input sent)"
+                    .to_string(),
+            );
+        }
+        // A user input later than the last agent input means the user took over.
+        // The wrapping difference keeps the comparison correct across GetTickCount wrap-around.
+        if agent_tick != 0 {
+            let since = user_tick.wrapping_sub(agent_tick);
+            if since > INJECTION_ECHO_GRACE_MS && since < 0x8000_0000 {
+                return Err(
+                    "user input detected since the last agent input; stopped without sending input"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod type_text_tests {
+    use super::input_guard::{decide, Target};
+    use super::*;
+    use std::cell::RefCell;
+
+    /// Fake element: records every `send_text` call (the keyboard-injection point).
+    struct FakeElement {
+        focusable: bool,
+        preflight: Result<(), String>,
+        sent: RefCell<Vec<String>>,
+    }
+
+    impl FakeElement {
+        fn new(focusable: bool, preflight: Result<(), String>) -> Self {
+            Self {
+                focusable,
+                preflight,
+                sent: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl TypeTextTarget for &FakeElement {
+        fn accepts_keyboard_input(&self) -> bool {
+            self.focusable
+        }
+
+        fn preflight(&self) -> Result<(), String> {
+            self.preflight.clone()
+        }
+
+        fn send_text(&self, text: &str, _interval_ms: u64) -> Result<()> {
+            self.sent.borrow_mut().push(text.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn unresolved_target_is_error_and_injects_nothing() {
+        let result = type_text_into::<&FakeElement>(None, "secret", 10).unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("not found"));
+    }
+
+    #[test]
+    fn element_without_keyboard_support_is_error_and_injects_nothing() {
+        let el = FakeElement::new(false, Ok(()));
+        let result = type_text_into(Some(&el), "secret", 10).unwrap();
+        assert!(result.is_error);
+        assert!(el.sent.borrow().is_empty(), "keyboard injector must not be invoked");
+    }
+
+    #[test]
+    fn hotkey_without_target_window_is_refused() {
+        use serde_json::json;
+        assert!(super::hotkey_target_refusal(&json!({ "hotkey": "ctrl+c" })).is_some());
+        assert!(super::hotkey_target_refusal(&json!({ "hotkey": "ctrl+c", "window_title": "" })).is_some());
+        assert!(super::hotkey_target_refusal(&json!({ "hotkey": "ctrl+c", "window_title": "   " })).is_some());
+        // find_window_hwnd prefers `name`, so an empty name refuses even with a real window_title.
+        assert!(super::hotkey_target_refusal(&json!({ "hotkey": "ctrl+c", "name": "", "window_title": "Notepad" })).is_some());
+        assert!(super::hotkey_target_refusal(&json!({ "hotkey": "ctrl+c", "window_title": "Notepad" })).is_none());
+        assert!(super::hotkey_target_refusal(&json!({ "hotkey": "ctrl+c", "name": "Notepad" })).is_none());
+    }
+
+    #[test]
+    fn failed_preflight_is_error_and_injects_nothing() {
+        let el = FakeElement::new(true, Err("focus lost".to_string()));
+        let result = type_text_into(Some(&el), "secret", 10).unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("focus lost"));
+        assert!(el.sent.borrow().is_empty(), "no input may follow a failed preflight");
+    }
+
+    #[test]
+    fn supported_element_receives_text_once() {
+        let el = FakeElement::new(true, Ok(()));
+        let result = type_text_into(Some(&el), "hello", 10).unwrap();
+        assert!(!result.is_error);
+        assert_eq!(*el.sent.borrow(), vec!["hello".to_string()]);
+    }
+
+    const TARGET: Target = Target {
+        root_hwnd: 100,
+        pid: 7,
+    };
+
+    #[test]
+    fn foreground_mismatch_is_focus_lost() {
+        let r = decide(200, 9, "Notepad", Some(&TARGET), 0, 0);
+        assert!(r.unwrap_err().starts_with("focus lost"));
+    }
+
+    #[test]
+    fn no_foreground_window_is_refused() {
+        assert!(decide(0, 0, "", Some(&TARGET), 0, 0).is_err());
+        assert!(decide(0, 0, "", None, 0, 0).is_err());
+    }
+
+    #[test]
+    fn matching_foreground_is_allowed() {
+        assert!(decide(100, 1, "Notepad", Some(&TARGET), 0, 0).is_ok());
+    }
+
+    #[test]
+    fn pid_fallback_matches_when_handle_unknown() {
+        let t = Target { root_hwnd: 0, pid: 7 };
+        assert!(decide(300, 7, "Edit", Some(&t), 0, 0).is_ok());
+        assert!(decide(300, 8, "Edit", Some(&t), 0, 0).is_err());
+        // Unknown pid and handle: never a match.
+        let unknown = Target { root_hwnd: 0, pid: 0 };
+        assert!(decide(300, 0, "Edit", Some(&unknown), 0, 0).is_err());
+    }
+
+    #[test]
+    fn protected_window_is_refused() {
+        let r = decide(100, 1, "Credential Dialog Xaml Host", Some(&TARGET), 0, 0);
+        assert!(r.unwrap_err().contains("credential"));
+        assert!(decide(100, 1, "CredUIBrokerWindow", None, 0, 0).is_err());
+    }
+
+    #[test]
+    fn user_input_after_agent_input_stops() {
+        // agent injected at tick 1000; user acted at 1500 (well past the echo grace)
+        let r = decide(100, 1, "Notepad", Some(&TARGET), 1500, 1000);
+        assert!(r.unwrap_err().contains("user input"));
+    }
+
+    #[test]
+    fn echo_of_own_input_is_not_user_input() {
+        assert!(decide(100, 1, "Notepad", Some(&TARGET), 1050, 1000).is_ok());
+    }
+
+    #[test]
+    fn user_input_before_agent_input_is_ignored() {
+        assert!(decide(100, 1, "Notepad", Some(&TARGET), 900, 1000).is_ok());
+    }
+
+    #[test]
+    fn no_prior_agent_input_means_no_takeover_check() {
+        assert!(decide(100, 1, "Notepad", Some(&TARGET), 5000, 0).is_ok());
+    }
+
+    #[test]
+    fn takeover_check_survives_tick_wraparound() {
+        // agent at u32::MAX - 10, user at 500 after wrap
+        assert!(decide(100, 1, "Notepad", Some(&TARGET), 500, u32::MAX - 10).unwrap_err().contains("user input"));
     }
 }
